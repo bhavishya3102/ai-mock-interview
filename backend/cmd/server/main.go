@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/auth"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/config"
-	httpapi "github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/http"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/llm"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/platform/logger"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/service"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/store"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/auth"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/config"
+	httpapi "github.com/bhavishya3102/ai-mock-interview/backend/internal/http"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/llm"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/platform/logger"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/service"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/store"
 )
 
 func main() {

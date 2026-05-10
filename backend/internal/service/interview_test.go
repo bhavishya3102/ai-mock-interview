@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/domain"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 	"github.com/stretchr/testify/require"
 )
 

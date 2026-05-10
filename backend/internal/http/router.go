@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/auth"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/auth"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/cors"

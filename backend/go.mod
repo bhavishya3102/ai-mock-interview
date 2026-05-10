@@ -1,4 +1,4 @@
-module github.com/bhavisachdeva/ai-mock-interview-v2/backend
+module github.com/bhavishya3102/ai-mock-interview/backend
 
 go 1.24
 

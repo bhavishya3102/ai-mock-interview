@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/auth"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/domain"
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/service"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/auth"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/service"
 	"github.com/go-chi/chi/v5"
 )
 

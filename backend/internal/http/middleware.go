@@ -7,7 +7,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/auth"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/auth"
 	"github.com/google/uuid"
 )
 

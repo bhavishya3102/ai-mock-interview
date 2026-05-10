@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/domain"
+	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 )
 
 // httpError pairs a status code with a low-cardinality user message + code.
