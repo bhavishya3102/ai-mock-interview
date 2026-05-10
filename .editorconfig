@@ -1,0 +1,41 @@
+# EditorConfig — https://editorconfig.org
+# Top-most config; tooling stops searching upward at this file.
+root = true
+
+# Defaults: UTF-8, LF endings, trim trailing whitespace, final newline.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go uses tabs (gofmt is non-negotiable on this).
+[*.go]
+indent_style = tab
+indent_size = 4
+
+# Go module/sum files are tab-indented as well.
+[{go.mod,go.sum}]
+indent_style = tab
+indent_size = 4
+
+# JS / TS / JSON / Markdown / YAML — 2-space indent (covered by default, listed for clarity).
+[*.{js,jsx,ts,tsx,mjs,cjs,json,jsonc,md,mdx,yml,yaml,html,css,scss}]
+indent_style = space
+indent_size = 2
+
+# Makefiles require literal tabs for recipe lines.
+[{Makefile,makefile,*.mk}]
+indent_style = tab
+indent_size = 4
+
+# Markdown: keep trailing whitespace (two trailing spaces = hard line break).
+[*.md]
+trim_trailing_whitespace = false
+
+# Shell scripts.
+[*.sh]
+indent_style = space
+indent_size = 2

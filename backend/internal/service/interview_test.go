@@ -1,0 +1,416 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bhavisachdeva/ai-mock-interview-v2/backend/internal/domain"
+	"github.com/stretchr/testify/require"
+)
+
+// fakeStore captures call args + lets each method's behaviour be overridden
+// per test via *Func fields. Empty defaults are happy path.
+type fakeStore struct {
+	upsertCalls          []string
+	createInterviewCalls []domain.MockInterview
+	upsertAnswerCalls    []domain.UserAnswer
+
+	upsertUserFunc           func(ctx context.Context, userID string) error
+	createInterviewFunc      func(ctx context.Context, m domain.MockInterview) error
+	listInterviewsByUserFunc func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
+	getInterviewByMockIDFunc func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
+	upsertAnswerFunc         func(ctx context.Context, a domain.UserAnswer) error
+	listAnswersByMockIDFunc  func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
+}
+
+func (f *fakeStore) UpsertUser(ctx context.Context, userID string) error {
+	f.upsertCalls = append(f.upsertCalls, userID)
+	if f.upsertUserFunc != nil {
+		return f.upsertUserFunc(ctx, userID)
+	}
+	return nil
+}
+
+func (f *fakeStore) CreateInterview(ctx context.Context, m domain.MockInterview) error {
+	f.createInterviewCalls = append(f.createInterviewCalls, m)
+	if f.createInterviewFunc != nil {
+		return f.createInterviewFunc(ctx, m)
+	}
+	return nil
+}
+
+func (f *fakeStore) ListInterviewsByUser(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error) {
+	if f.listInterviewsByUserFunc != nil {
+		return f.listInterviewsByUserFunc(ctx, userID, limit)
+	}
+	return []domain.InterviewSummary{}, nil
+}
+
+func (f *fakeStore) GetInterviewByMockID(ctx context.Context, mockID, userID string) (domain.MockInterview, error) {
+	if f.getInterviewByMockIDFunc != nil {
+		return f.getInterviewByMockIDFunc(ctx, mockID, userID)
+	}
+	return domain.MockInterview{}, domain.ErrNotFound
+}
+
+func (f *fakeStore) UpsertAnswer(ctx context.Context, a domain.UserAnswer) error {
+	f.upsertAnswerCalls = append(f.upsertAnswerCalls, a)
+	if f.upsertAnswerFunc != nil {
+		return f.upsertAnswerFunc(ctx, a)
+	}
+	return nil
+}
+
+func (f *fakeStore) ListAnswersByMockID(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error) {
+	if f.listAnswersByMockIDFunc != nil {
+		return f.listAnswersByMockIDFunc(ctx, mockID, userID)
+	}
+	return []domain.UserAnswer{}, nil
+}
+
+type fakeLLM struct {
+	generateQuestionsFunc func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
+	evaluateAnswerFunc    func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
+	transcribeAudioFunc   func(ctx context.Context, audio []byte, mimeType string) (string, error)
+}
+
+func (f *fakeLLM) GenerateQuestions(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error) {
+	if f.generateQuestionsFunc != nil {
+		return f.generateQuestionsFunc(ctx, in)
+	}
+	return defaultQuestions(), nil
+}
+
+func (f *fakeLLM) EvaluateAnswer(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error) {
+	if f.evaluateAnswerFunc != nil {
+		return f.evaluateAnswerFunc(ctx, in)
+	}
+	return domain.Evaluation{Rating: 8, Feedback: "decent answer with minor gaps to address"}, nil
+}
+
+func (f *fakeLLM) TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (string, error) {
+	if f.transcribeAudioFunc != nil {
+		return f.transcribeAudioFunc(ctx, audio, mimeType)
+	}
+	return "fake transcript", nil
+}
+
+func defaultQuestions() []domain.GeneratedQA {
+	out := make([]domain.GeneratedQA, 0, 5)
+	for i := 0; i < 5; i++ {
+		out = append(out, domain.GeneratedQA{
+			Question: "what is your approach to problem N",
+			Answer:   "describe approach with examples and tradeoffs",
+		})
+	}
+	return out
+}
+
+func sampleInterview(userID string) domain.MockInterview {
+	return domain.MockInterview{
+		MockID:          "mock-123",
+		ClerkUserID:     userID,
+		JobPosition:     "Backend Engineer",
+		JobDescription:  "Build distributed systems with Go",
+		YearsExperience: 5,
+		Questions:       defaultQuestions(),
+		CreatedAt:       time.Now().UTC(),
+	}
+}
+
+const validJobDescription = "Build and maintain distributed Go systems on AWS"
+
+// --- CreateInterview ---
+
+func TestCreateInterview_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.CreateInterview(context.Background(), "", CreateInterviewInput{
+		JobPosition: "x", JobDescription: validJobDescription, YearsExperience: 1,
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestCreateInterview_ValidationFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		in   CreateInterviewInput
+	}{
+		{"position too short", CreateInterviewInput{JobPosition: "a", JobDescription: validJobDescription, YearsExperience: 3}},
+		{"position too long", CreateInterviewInput{JobPosition: strings.Repeat("a", 121), JobDescription: validJobDescription, YearsExperience: 3}},
+		{"description too short", CreateInterviewInput{JobPosition: "Backend", JobDescription: "tiny", YearsExperience: 3}},
+		{"description too long", CreateInterviewInput{JobPosition: "Backend", JobDescription: strings.Repeat("a", 4001), YearsExperience: 3}},
+		{"years negative", CreateInterviewInput{JobPosition: "Backend", JobDescription: validJobDescription, YearsExperience: -1}},
+		{"years too high", CreateInterviewInput{JobPosition: "Backend", JobDescription: validJobDescription, YearsExperience: 61}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+			_, err := svc.CreateInterview(context.Background(), "user_1", tt.in)
+			require.Error(t, err)
+			require.ErrorIs(t, err, domain.ErrValidation)
+		})
+	}
+}
+
+func TestCreateInterview_HappyPath(t *testing.T) {
+	store := &fakeStore{}
+	store.getInterviewByMockIDFunc = func(_ context.Context, mockID, userID string) (domain.MockInterview, error) {
+		require.Equal(t, "user_1", userID)
+		return sampleInterview(userID), nil
+	}
+	llm := &fakeLLM{}
+
+	svc := NewInterviewService(store, llm)
+	mi, err := svc.CreateInterview(context.Background(), "user_1", CreateInterviewInput{
+		JobPosition:     "Backend Engineer",
+		JobDescription:  validJobDescription,
+		YearsExperience: 5,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "user_1", mi.ClerkUserID)
+	require.Len(t, mi.Questions, 5)
+	require.Equal(t, []string{"user_1"}, store.upsertCalls, "user upserted exactly once")
+	require.Len(t, store.createInterviewCalls, 1)
+}
+
+func TestCreateInterview_LLMFailureMaps(t *testing.T) {
+	llm := &fakeLLM{
+		generateQuestionsFunc: func(_ context.Context, _ domain.InterviewSeed) ([]domain.GeneratedQA, error) {
+			return nil, errors.Join(domain.ErrLLM, errors.New("upstream broke"))
+		},
+	}
+	svc := NewInterviewService(&fakeStore{}, llm)
+	_, err := svc.CreateInterview(context.Background(), "user_1", CreateInterviewInput{
+		JobPosition: "Backend", JobDescription: validJobDescription, YearsExperience: 3,
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, domain.ErrLLM)
+}
+
+func TestCreateInterview_StoreErrorPropagates(t *testing.T) {
+	store := &fakeStore{
+		createInterviewFunc: func(_ context.Context, _ domain.MockInterview) error {
+			return errors.New("db down")
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.CreateInterview(context.Background(), "user_1", CreateInterviewInput{
+		JobPosition: "Backend", JobDescription: validJobDescription, YearsExperience: 3,
+	})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, domain.ErrValidation)
+}
+
+// --- GetInterview ---
+
+func TestGetInterview_MissingMockID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GetInterview(context.Background(), "user_1", "")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestGetInterview_OwnershipViaNotFound(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return domain.MockInterview{}, domain.ErrNotFound
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.GetInterview(context.Background(), "user_1", "mock-x")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestGetInterview_HappyPath(t *testing.T) {
+	want := sampleInterview("user_1")
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, mockID, userID string) (domain.MockInterview, error) {
+			require.Equal(t, "mock-123", mockID)
+			require.Equal(t, "user_1", userID)
+			return want, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	got, err := svc.GetInterview(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Equal(t, want.MockID, got.MockID)
+}
+
+// --- SubmitAnswer ---
+
+func TestSubmitAnswer_Validation(t *testing.T) {
+	tests := []struct {
+		name string
+		in   SubmitAnswerInput
+	}{
+		{"empty mock id", SubmitAnswerInput{MockID: "", QuestionIndex: 0, UserAnswer: "answer"}},
+		{"negative index", SubmitAnswerInput{MockID: "m", QuestionIndex: -1, UserAnswer: "answer"}},
+		{"empty user answer", SubmitAnswerInput{MockID: "m", QuestionIndex: 0, UserAnswer: ""}},
+		{"too long user answer", SubmitAnswerInput{MockID: "m", QuestionIndex: 0, UserAnswer: strings.Repeat("a", 8001)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+			_, err := svc.SubmitAnswer(context.Background(), "user_1", tt.in)
+			require.ErrorIs(t, err, domain.ErrValidation)
+		})
+	}
+}
+
+func TestSubmitAnswer_OwnershipNotFound(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return domain.MockInterview{}, domain.ErrNotFound
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-x", QuestionIndex: 0, UserAnswer: "fine answer",
+	})
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestSubmitAnswer_QuestionIndexOutOfRange(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-123", QuestionIndex: 10, UserAnswer: "fine answer",
+	})
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestSubmitAnswer_LLMFailureMaps(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	llm := &fakeLLM{
+		evaluateAnswerFunc: func(_ context.Context, _ domain.AnswerSeed) (domain.Evaluation, error) {
+			return domain.Evaluation{}, errors.Join(domain.ErrLLM, errors.New("model timeout"))
+		},
+	}
+	svc := NewInterviewService(store, llm)
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-123", QuestionIndex: 0, UserAnswer: "fine answer",
+	})
+	require.ErrorIs(t, err, domain.ErrLLM)
+}
+
+func TestSubmitAnswer_ResubmissionUpserts(t *testing.T) {
+	// Re-attempting the same question must succeed and overwrite the prior
+	// row — the store maps that to UpsertAnswer, so the service should never
+	// surface a conflict error on resubmission.
+	latest := domain.UserAnswer{
+		MockID: "mock-123", ClerkUserID: "user_1",
+		QuestionIndex: 0, Rating: 9, Feedback: "much better second take",
+	}
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, _, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{latest}, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-123", QuestionIndex: 0, UserAnswer: "first take",
+	})
+	require.NoError(t, err)
+
+	got, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-123", QuestionIndex: 0, UserAnswer: "second, better take",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 9, got.Rating)
+	require.Len(t, store.upsertAnswerCalls, 2, "both attempts hit the store")
+	require.Equal(t, "second, better take", store.upsertAnswerCalls[1].UserAnswer)
+}
+
+func TestSubmitAnswer_HappyPath(t *testing.T) {
+	now := time.Now().UTC()
+	saved := domain.UserAnswer{
+		MockID: "mock-123", ClerkUserID: "user_1",
+		QuestionIndex: 0, Rating: 8, Feedback: "decent answer with minor gaps to address",
+		CreatedAt: now,
+	}
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, _, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{saved}, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	got, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID: "mock-123", QuestionIndex: 0, UserAnswer: "good and structured answer",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 8, got.Rating)
+	require.Len(t, store.upsertAnswerCalls, 1)
+	require.Equal(t, 0, store.upsertAnswerCalls[0].QuestionIndex)
+}
+
+// --- ListInterviews / ListFeedback ---
+
+func TestListInterviews_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.ListInterviews(context.Background(), "", 0)
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestListInterviews_LimitClamping(t *testing.T) {
+	var capturedLimit int
+	store := &fakeStore{
+		listInterviewsByUserFunc: func(_ context.Context, _ string, limit int) ([]domain.InterviewSummary, error) {
+			capturedLimit = limit
+			return []domain.InterviewSummary{}, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	_, err := svc.ListInterviews(context.Background(), "user_1", 0)
+	require.NoError(t, err)
+	require.Equal(t, 20, capturedLimit, "default to 20 when limit unspecified")
+
+	_, err = svc.ListInterviews(context.Background(), "user_1", 1000)
+	require.NoError(t, err)
+	require.Equal(t, 50, capturedLimit, "clamp to listLimit (50)")
+}
+
+func TestListFeedback_OwnershipNotFound(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return domain.MockInterview{}, domain.ErrNotFound
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.ListFeedback(context.Background(), "user_1", "mock-x")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestListFeedback_HappyPath(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, _, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{{QuestionIndex: 0, Rating: 9, Feedback: "great"}}, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	got, err := svc.ListFeedback(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, 9, got[0].Rating)
+}

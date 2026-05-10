@@ -1,0 +1,47 @@
+-- Queries for sqlc generation. Even though the repo files use hand-written
+-- pgxpool calls today, this file is the source of truth for generated code
+-- via `make gen`. Keep names and shapes in sync.
+
+-- name: UpsertUser :exec
+INSERT INTO users (clerk_user_id)
+VALUES ($1)
+ON CONFLICT (clerk_user_id)
+DO UPDATE SET updated_at = now();
+
+-- name: CreateInterview :exec
+INSERT INTO mock_interviews (
+    mock_id, clerk_user_id, job_position, job_description,
+    years_experience, questions
+) VALUES ($1, $2, $3, $4, $5, $6);
+
+-- name: ListInterviewsByUser :many
+SELECT mock_id, job_position, job_description, years_experience, created_at
+FROM mock_interviews
+WHERE clerk_user_id = $1
+ORDER BY created_at DESC, mock_id DESC
+LIMIT $2;
+
+-- name: GetInterviewByMockID :one
+SELECT mock_id, clerk_user_id, job_position, job_description,
+       years_experience, questions, created_at
+FROM mock_interviews
+WHERE mock_id = $1 AND clerk_user_id = $2;
+
+-- name: UpsertAnswer :exec
+INSERT INTO user_answers (
+    mock_id, clerk_user_id, question_index, question_text,
+    correct_answer, user_answer, rating, feedback
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (mock_id, question_index, clerk_user_id) DO UPDATE
+SET question_text  = EXCLUDED.question_text,
+    correct_answer = EXCLUDED.correct_answer,
+    user_answer    = EXCLUDED.user_answer,
+    rating         = EXCLUDED.rating,
+    feedback       = EXCLUDED.feedback;
+
+-- name: ListAnswersByMockID :many
+SELECT mock_id, clerk_user_id, question_index, question_text,
+       correct_answer, user_answer, rating, feedback, created_at
+FROM user_answers
+WHERE mock_id = $1 AND clerk_user_id = $2
+ORDER BY question_index ASC;
