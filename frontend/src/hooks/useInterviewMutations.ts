@@ -1,8 +1,11 @@
 import { useMutation, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
 import {
   createInterview,
+  judgeFollowUp,
   submitAnswer,
   transcribeAudio,
+  type JudgeFollowUpInput,
+  type JudgeFollowUpResponse,
   type TranscribeAudioResponse,
 } from "@/api/interviews";
 import { queryKeys } from "@/api/queryKeys";
@@ -36,10 +39,23 @@ export function useSubmitAnswer(): UseMutationResult<UserAnswer, Error, SubmitAn
 export interface TranscribeAudioArgs {
   mockId: string;
   audio: Blob;
+  longPauseCount: number;
 }
 
 export function useTranscribeAudio(): UseMutationResult<TranscribeAudioResponse, Error, TranscribeAudioArgs> {
   return useMutation({
-    mutationFn: ({ mockId, audio }: TranscribeAudioArgs) => transcribeAudio(mockId, audio),
+    mutationFn: ({ mockId, audio, longPauseCount }: TranscribeAudioArgs) =>
+      transcribeAudio(mockId, audio, longPauseCount),
+  });
+}
+
+export interface JudgeFollowUpArgs {
+  mockId: string;
+  payload: JudgeFollowUpInput;
+}
+
+export function useJudgeFollowUp(): UseMutationResult<JudgeFollowUpResponse, Error, JudgeFollowUpArgs> {
+  return useMutation({
+    mutationFn: ({ mockId, payload }: JudgeFollowUpArgs) => judgeFollowUp(mockId, payload),
   });
 }

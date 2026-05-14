@@ -76,27 +76,32 @@ func (c *Client) GenerateQuestions(ctx context.Context, in domain.InterviewSeed)
 }
 
 // TranscribeAudio sends audio bytes to Gemini and returns the verbatim
-// transcript. Used by the record-answer flow so non-Chromium browsers (and
-// flaky Web Speech sessions) can still capture spoken answers reliably.
+// transcript plus delivery metrics (filler count, words/min, long pauses).
+// All four come back in one structured call — cheaper than a follow-up
+// analysis round-trip.
 //
 // mimeType must match what the browser's MediaRecorder produced (typically
 // "audio/webm" with Opus on Chromium/Firefox, "audio/mp4" on Safari). Empty
 // audio is rejected before the API round-trip to save quota.
-func (c *Client) TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (string, error) {
+func (c *Client) TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error) {
 	if len(audio) == 0 {
-		return "", fmt.Errorf("gemini transcribe: empty audio: %w", domain.ErrValidation)
+		return domain.TranscriptResult{}, fmt.Errorf("gemini transcribe: empty audio: %w", domain.ErrValidation)
 	}
 	if mimeType == "" {
-		return "", fmt.Errorf("gemini transcribe: empty mime type: %w", domain.ErrValidation)
+		return domain.TranscriptResult{}, fmt.Errorf("gemini transcribe: empty mime type: %w", domain.ErrValidation)
 	}
 
 	cfg := &genai.GenerateContentConfig{
-		Temperature: genai.Ptr[float32](0.0),
+		Temperature:      genai.Ptr[float32](0.0),
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   transcribeSchema,
 	}
 
 	prompt := "Transcribe the spoken audio verbatim into plain text. " +
-		"Do not add commentary, speaker labels, timestamps, or markdown. " +
-		"If the audio is silent or unintelligible, return an empty string."
+		"Return JSON with exactly these fields:\n" +
+		"- transcript: the verbatim words spoken, INCLUDING every filler (um, uh, er, ah, like, you know, etc.). " +
+		"No commentary, speaker labels, timestamps, or markdown. Empty string if silent or unintelligible.\n" +
+		"- wordsPerMinute: rate of actual spoken words across audible speech only (exclude long silent gaps). Integer. 0 if no speech."
 
 	contents := []*genai.Content{
 		genai.NewContentFromParts([]*genai.Part{
@@ -107,9 +112,74 @@ func (c *Client) TranscribeAudio(ctx context.Context, audio []byte, mimeType str
 
 	resp, err := c.sdk.Models.GenerateContent(ctx, c.model, contents, cfg)
 	if err != nil {
-		return "", fmt.Errorf("gemini transcribe audio: %w", errors.Join(domain.ErrLLM, err))
+		return domain.TranscriptResult{}, fmt.Errorf("gemini transcribe audio: %w", errors.Join(domain.ErrLLM, err))
 	}
-	return resp.Text(), nil
+
+	raw := resp.Text()
+	if raw == "" {
+		return domain.TranscriptResult{}, fmt.Errorf("gemini empty response: %w", domain.ErrLLM)
+	}
+
+	// Gemini's schema is flat (transcript + wordsPerMinute at top level), but
+	// our domain type nests delivery metrics under Analysis. Decode flat, then
+	// map. Filler counting is deterministic and runs server-side here so the
+	// LLM doesn't need to count or moderate.
+	var flat struct {
+		Transcript     string `json:"transcript"`
+		WordsPerMinute int    `json:"wordsPerMinute"`
+	}
+	if err := json.Unmarshal([]byte(raw), &flat); err != nil {
+		return domain.TranscriptResult{}, fmt.Errorf("gemini decode transcript: %w", errors.Join(domain.ErrLLM, err))
+	}
+	return domain.TranscriptResult{
+		Transcript: flat.Transcript,
+		Analysis: domain.SpeechAnalysis{
+			FillerCount:    CountFillers(flat.Transcript),
+			WordsPerMinute: flat.WordsPerMinute,
+			// LongPauseCount is set by the service from the client's VAD count.
+		},
+	}, nil
+}
+
+// JudgeFollowUp asks the model whether the candidate needs one more
+// probing follow-up. Returns the follow-up question string, or empty string
+// if the model judges the answer good enough. Output is constrained by
+// followUpSchema.
+//
+// The hard cap on number of follow-ups is enforced by the service layer —
+// this method always calls the LLM regardless of how many prior turns are
+// supplied.
+func (c *Client) JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error) {
+	cfg := &genai.GenerateContentConfig{
+		Temperature:      genai.Ptr[float32](0.3),
+		TopP:             genai.Ptr[float32](0.9),
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   followUpSchema,
+	}
+
+	resp, err := c.sdk.Models.GenerateContent(
+		ctx,
+		c.model,
+		genai.Text(buildFollowUpPrompt(in)),
+		cfg,
+	)
+	if err != nil {
+		return "", fmt.Errorf("gemini judge follow-up: %w", errors.Join(domain.ErrLLM, err))
+	}
+
+	raw := resp.Text()
+	if raw == "" {
+		return "", fmt.Errorf("gemini empty response: %w", domain.ErrLLM)
+	}
+
+	var out struct {
+		FollowUp string `json:"followUp"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return "", fmt.Errorf("gemini decode follow-up: %w", errors.Join(domain.ErrLLM, err))
+	}
+	return out.FollowUp, nil
 }
 
 // EvaluateAnswer asks the model to rate the candidate's answer 1..10 with

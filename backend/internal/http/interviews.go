@@ -39,7 +39,8 @@ type InterviewService interface {
 	GetInterview(ctx context.Context, clerkUserID, mockID string) (domain.MockInterview, error)
 	SubmitAnswer(ctx context.Context, clerkUserID string, in service.SubmitAnswerInput) (domain.UserAnswer, error)
 	ListFeedback(ctx context.Context, clerkUserID, mockID string) ([]domain.UserAnswer, error)
-	TranscribeAudio(ctx context.Context, clerkUserID, mockID string, audio []byte, mimeType string) (string, error)
+	TranscribeAudio(ctx context.Context, clerkUserID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
+	JudgeFollowUp(ctx context.Context, clerkUserID string, in service.JudgeFollowUpInput) (string, error)
 }
 
 // InterviewHandler holds dependencies for the 5 interview endpoints.
@@ -224,8 +225,68 @@ func (h *InterviewHandler) SubmitAnswer(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, h.log, http.StatusCreated, toSubmitAnswerResponse(a))
 }
 
+type speechAnalysisResponse struct {
+	FillerCount    int `json:"fillerCount"`
+	WordsPerMinute int `json:"wordsPerMinute"`
+	LongPauseCount int `json:"longPauseCount"`
+}
+
 type transcribeResponse struct {
-	Transcript string `json:"transcript"`
+	Transcript string                 `json:"transcript"`
+	Analysis   speechAnalysisResponse `json:"analysis"`
+}
+
+type followUpTurnDTO struct {
+	Question string `json:"question" validate:"required,min=1,max=2000"`
+	Answer   string `json:"answer"   validate:"required,min=1,max=8000"`
+}
+
+type judgeFollowUpRequest struct {
+	QuestionIndex int               `json:"questionIndex" validate:"gte=0,lte=4"`
+	MainAnswer    string            `json:"mainAnswer"    validate:"required,min=1,max=8000"`
+	PriorTurns    []followUpTurnDTO `json:"priorTurns"    validate:"dive"`
+}
+
+type judgeFollowUpResponse struct {
+	FollowUp string `json:"followUp"`
+}
+
+// JudgeFollowUp handles POST /api/v1/interviews/{mockId}/follow-up.
+//
+// Decides whether the candidate's current answer needs one more probing
+// follow-up. Empty followUp string means "move on". Hard cap and ownership
+// are enforced server-side regardless of what the client sends.
+func (h *InterviewHandler) JudgeFollowUp(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		h.respondErr(w, r, errors.New("missing user id"), domain.ErrUnauthorized)
+		return
+	}
+
+	mockID := chi.URLParam(r, "mockId")
+
+	var req judgeFollowUpRequest
+	if err := decodeAndValidate(r, &req); err != nil {
+		h.respondErr(w, r, err, nil)
+		return
+	}
+
+	turns := make([]domain.FollowUpTurn, 0, len(req.PriorTurns))
+	for _, t := range req.PriorTurns {
+		turns = append(turns, domain.FollowUpTurn{Question: t.Question, Answer: t.Answer})
+	}
+
+	follow, err := h.svc.JudgeFollowUp(r.Context(), userID, service.JudgeFollowUpInput{
+		MockID:        mockID,
+		QuestionIndex: req.QuestionIndex,
+		MainAnswer:    req.MainAnswer,
+		PriorTurns:    turns,
+	})
+	if err != nil {
+		h.respondErr(w, r, err, nil)
+		return
+	}
+	writeJSON(w, h.log, http.StatusOK, judgeFollowUpResponse{FollowUp: follow})
 }
 
 // Transcribe handles POST /api/v1/interviews/{mockId}/transcribe.
@@ -282,12 +343,28 @@ func (h *InterviewHandler) Transcribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	transcript, err := h.svc.TranscribeAudio(r.Context(), userID, mockID, audio, mimeType)
+	// longPauseCount is measured client-side by the recorder's VAD; missing or
+	// malformed values silently default to 0 — pauses are advisory, not gating.
+	longPauseCount := 0
+	if raw := r.FormValue("longPauseCount"); raw != "" {
+		if n, perr := strconv.Atoi(raw); perr == nil && n >= 0 {
+			longPauseCount = n
+		}
+	}
+
+	result, err := h.svc.TranscribeAudio(r.Context(), userID, mockID, audio, mimeType, longPauseCount)
 	if err != nil {
 		h.respondErr(w, r, err, nil)
 		return
 	}
-	writeJSON(w, h.log, http.StatusOK, transcribeResponse{Transcript: transcript})
+	writeJSON(w, h.log, http.StatusOK, transcribeResponse{
+		Transcript: result.Transcript,
+		Analysis: speechAnalysisResponse{
+			FillerCount:    result.Analysis.FillerCount,
+			WordsPerMinute: result.Analysis.WordsPerMinute,
+			LongPauseCount: result.Analysis.LongPauseCount,
+		},
+	})
 }
 
 // normalizeAudioMime strips codec parameters and validates against the

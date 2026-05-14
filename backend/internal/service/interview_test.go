@@ -74,7 +74,8 @@ func (f *fakeStore) ListAnswersByMockID(ctx context.Context, mockID, userID stri
 type fakeLLM struct {
 	generateQuestionsFunc func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
 	evaluateAnswerFunc    func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
-	transcribeAudioFunc   func(ctx context.Context, audio []byte, mimeType string) (string, error)
+	transcribeAudioFunc   func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	judgeFollowUpFunc     func(ctx context.Context, in domain.FollowUpSeed) (string, error)
 }
 
 func (f *fakeLLM) GenerateQuestions(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error) {
@@ -91,11 +92,18 @@ func (f *fakeLLM) EvaluateAnswer(ctx context.Context, in domain.AnswerSeed) (dom
 	return domain.Evaluation{Rating: 8, Feedback: "decent answer with minor gaps to address"}, nil
 }
 
-func (f *fakeLLM) TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (string, error) {
+func (f *fakeLLM) TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error) {
 	if f.transcribeAudioFunc != nil {
 		return f.transcribeAudioFunc(ctx, audio, mimeType)
 	}
-	return "fake transcript", nil
+	return domain.TranscriptResult{Transcript: "fake transcript"}, nil
+}
+
+func (f *fakeLLM) JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error) {
+	if f.judgeFollowUpFunc != nil {
+		return f.judgeFollowUpFunc(ctx, in)
+	}
+	return "", nil
 }
 
 func defaultQuestions() []domain.GeneratedQA {
@@ -413,4 +421,155 @@ func TestListFeedback_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, 9, got[0].Rating)
+}
+
+// --- JudgeFollowUp ---
+
+func TestJudgeFollowUp_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.JudgeFollowUp(context.Background(), "", JudgeFollowUpInput{
+		MockID:     "mock-123",
+		MainAnswer: "an answer",
+	})
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestJudgeFollowUp_RequiresMainAnswer(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.JudgeFollowUp(context.Background(), "user_1", JudgeFollowUpInput{
+		MockID:     "mock-123",
+		MainAnswer: "   ",
+	})
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestJudgeFollowUp_OwnershipChecked(t *testing.T) {
+	// Store returns ErrNotFound by default — non-owner can never reach LLM.
+	llmCalled := false
+	llm := &fakeLLM{
+		judgeFollowUpFunc: func(_ context.Context, _ domain.FollowUpSeed) (string, error) {
+			llmCalled = true
+			return "should not be called", nil
+		},
+	}
+	svc := NewInterviewService(&fakeStore{}, llm)
+	_, err := svc.JudgeFollowUp(context.Background(), "user_1", JudgeFollowUpInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		MainAnswer:    "an answer",
+	})
+	require.ErrorIs(t, err, domain.ErrNotFound)
+	require.False(t, llmCalled, "LLM must not be invoked when ownership check fails")
+}
+
+func TestJudgeFollowUp_CapShortCircuitsLLM(t *testing.T) {
+	// Exactly MaxFollowUpsPerQuestion turns already exchanged — service must
+	// return "" without burning a token.
+	llmCalled := false
+	llm := &fakeLLM{
+		judgeFollowUpFunc: func(_ context.Context, _ domain.FollowUpSeed) (string, error) {
+			llmCalled = true
+			return "should not be called", nil
+		},
+	}
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	turns := make([]domain.FollowUpTurn, MaxFollowUpsPerQuestion)
+	for i := range turns {
+		turns[i] = domain.FollowUpTurn{Question: "fq", Answer: "fa"}
+	}
+
+	got, err := svc.JudgeFollowUp(context.Background(), "user_1", JudgeFollowUpInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		MainAnswer:    "an answer",
+		PriorTurns:    turns,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "", got, "cap reached — service must return empty without LLM call")
+	require.False(t, llmCalled)
+}
+
+func TestJudgeFollowUp_PassesThroughLLMResult(t *testing.T) {
+	llm := &fakeLLM{
+		judgeFollowUpFunc: func(_ context.Context, in domain.FollowUpSeed) (string, error) {
+			require.Equal(t, "Backend Engineer", in.JobPosition)
+			require.Equal(t, "an answer", in.MainAnswer)
+			require.Empty(t, in.PriorTurns)
+			return "  Can you walk me through the trade-offs?  ", nil
+		},
+	}
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+	got, err := svc.JudgeFollowUp(context.Background(), "user_1", JudgeFollowUpInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		MainAnswer:    "an answer",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "Can you walk me through the trade-offs?", got)
+}
+
+// --- TranscribeAudio ---
+
+func TestTranscribeAudio_PassesThroughAnalysis(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	llm := &fakeLLM{
+		transcribeAudioFunc: func(_ context.Context, _ []byte, _ string) (domain.TranscriptResult, error) {
+			// LLM returns filler+wpm; longPauseCount comes from the caller (client VAD).
+			return domain.TranscriptResult{
+				Transcript: "  spoken words  ",
+				Analysis:   domain.SpeechAnalysis{FillerCount: 4, WordsPerMinute: 142},
+			}, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+	got, err := svc.TranscribeAudio(context.Background(), "user_1", "mock-123", []byte("not-empty"), "audio/webm", 2)
+	require.NoError(t, err)
+	require.Equal(t, "spoken words", got.Transcript, "service must trim whitespace")
+	require.Equal(t, 4, got.Analysis.FillerCount)
+	require.Equal(t, 142, got.Analysis.WordsPerMinute)
+	require.Equal(t, 2, got.Analysis.LongPauseCount, "service must overwrite LongPauseCount with the caller-supplied value")
+}
+
+func TestTranscribeAudio_OwnershipChecked(t *testing.T) {
+	llmCalled := false
+	llm := &fakeLLM{
+		transcribeAudioFunc: func(_ context.Context, _ []byte, _ string) (domain.TranscriptResult, error) {
+			llmCalled = true
+			return domain.TranscriptResult{}, nil
+		},
+	}
+	svc := NewInterviewService(&fakeStore{}, llm)
+	_, err := svc.TranscribeAudio(context.Background(), "user_1", "mock-x", []byte("not-empty"), "audio/webm", 0)
+	require.ErrorIs(t, err, domain.ErrNotFound)
+	require.False(t, llmCalled, "LLM must not be invoked when ownership check fails")
+}
+
+func TestJudgeFollowUp_QuestionIndexOutOfRange(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return sampleInterview("user_1"), nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	_, err := svc.JudgeFollowUp(context.Background(), "user_1", JudgeFollowUpInput{
+		MockID:        "mock-123",
+		QuestionIndex: 99,
+		MainAnswer:    "an answer",
+	})
+	require.ErrorIs(t, err, domain.ErrValidation)
 }

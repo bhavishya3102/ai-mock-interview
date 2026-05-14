@@ -49,13 +49,21 @@ export async function submitAnswer(
   });
 }
 
+export interface SpeechAnalysis {
+  fillerCount: number;
+  wordsPerMinute: number;
+  longPauseCount: number;
+}
+
 export interface TranscribeAudioResponse {
   transcript: string;
+  analysis: SpeechAnalysis;
 }
 
 export async function transcribeAudio(
   mockId: string,
   audio: Blob,
+  longPauseCount: number,
   signal?: AbortSignal,
 ): Promise<TranscribeAudioResponse> {
   const form = new FormData();
@@ -71,11 +79,37 @@ export async function transcribeAudio(
           ? "wav"
           : "bin";
   form.append("audio", audio, `answer.${ext}`);
+  form.append("longPauseCount", String(Math.max(0, Math.floor(longPauseCount))));
   const init: Parameters<typeof apiFetch>[1] = { method: "POST", body: form };
   if (signal) init.signal = signal;
   return apiFetch<TranscribeAudioResponse>(
     `/interviews/${encodeURIComponent(mockId)}/transcribe`,
     init,
+  );
+}
+
+export interface FollowUpTurn {
+  question: string;
+  answer: string;
+}
+
+export interface JudgeFollowUpInput {
+  questionIndex: number;
+  mainAnswer: string;
+  priorTurns: FollowUpTurn[];
+}
+
+export interface JudgeFollowUpResponse {
+  followUp: string;
+}
+
+export async function judgeFollowUp(
+  mockId: string,
+  payload: JudgeFollowUpInput,
+): Promise<JudgeFollowUpResponse> {
+  return apiFetch<JudgeFollowUpResponse>(
+    `/interviews/${encodeURIComponent(mockId)}/follow-up`,
+    { method: "POST", body: payload },
   );
 }
 

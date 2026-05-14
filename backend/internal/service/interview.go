@@ -29,8 +29,13 @@ type Store interface {
 type LLMClient interface {
 	GenerateQuestions(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
 	EvaluateAnswer(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
-	TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (string, error)
+	TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error)
 }
+
+// MaxFollowUpsPerQuestion is the hard cap on follow-ups per main question.
+// Enforced by JudgeFollowUp so a misbehaving prompt cannot loop forever.
+const MaxFollowUpsPerQuestion = 2
 
 // CreateInterviewInput is the validated input for CreateInterview. The
 // HTTP layer constructs it from a request DTO; this layer assumes already-
@@ -46,6 +51,14 @@ type SubmitAnswerInput struct {
 	MockID        string
 	QuestionIndex int
 	UserAnswer    string
+}
+
+// JudgeFollowUpInput is the validated input for JudgeFollowUp.
+type JudgeFollowUpInput struct {
+	MockID        string
+	QuestionIndex int
+	MainAnswer    string
+	PriorTurns    []domain.FollowUpTurn
 }
 
 // InterviewService orchestrates the interview workflows.
@@ -224,7 +237,61 @@ func (s *InterviewService) SubmitAnswer(
 	return domain.UserAnswer{}, errors.New("submit answer: upserted row missing from readback")
 }
 
-// TranscribeAudio runs the audio through the LLM and returns the transcript.
+// JudgeFollowUp asks the LLM whether the candidate needs one more probing
+// follow-up. Returns "" when no further probe is warranted — either because
+// the LLM judged the answer good enough or because the hard cap has been
+// reached. Ownership of mockID and a valid questionIndex are required.
+func (s *InterviewService) JudgeFollowUp(
+	ctx context.Context,
+	clerkUserID string,
+	in JudgeFollowUpInput,
+) (string, error) {
+	if clerkUserID == "" {
+		return "", fmt.Errorf("judge follow-up: %w", domain.ErrUnauthorized)
+	}
+	if strings.TrimSpace(in.MockID) == "" {
+		return "", fmt.Errorf("judge follow-up: %w", domain.ErrValidation)
+	}
+	if strings.TrimSpace(in.MainAnswer) == "" {
+		return "", fmt.Errorf("judge follow-up: %w", domain.ErrValidation)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return "", fmt.Errorf("judge follow-up: %w", err)
+	}
+	mi, err := s.store.GetInterviewByMockID(ctx, in.MockID, clerkUserID)
+	if err != nil {
+		return "", fmt.Errorf("judge follow-up: %w", err)
+	}
+	if in.QuestionIndex < 0 || in.QuestionIndex >= len(mi.Questions) {
+		return "", fmt.Errorf("judge follow-up: question index out of range: %w", domain.ErrValidation)
+	}
+	// Hard cap: never call the LLM once the limit has been hit. The empty
+	// string tells the caller "move on" without burning a token.
+	if len(in.PriorTurns) >= MaxFollowUpsPerQuestion {
+		return "", nil
+	}
+
+	qa := mi.Questions[in.QuestionIndex]
+	follow, err := s.llm.JudgeFollowUp(ctx, domain.FollowUpSeed{
+		JobPosition:  mi.JobPosition,
+		MainQuestion: qa.Question,
+		MainAnswer:   in.MainAnswer,
+		PriorTurns:   in.PriorTurns,
+	})
+	if err != nil {
+		return "", fmt.Errorf("judge follow-up: %w", err)
+	}
+	return strings.TrimSpace(follow), nil
+}
+
+// TranscribeAudio runs the audio through the LLM and returns the transcript
+// plus delivery metrics (filler count, words/min, long pauses).
+//
+// longPauseCount comes from the client's voice-activity detection during
+// recording — counting silent gaps from server-side audio analysis would
+// require an audio decoder, and LLMs are unreliable at it. The service
+// clamps it to a sane range.
+//
 // Ownership of mockID is enforced first so a non-owner can never burn the
 // LLM quota of the real owner.
 func (s *InterviewService) TranscribeAudio(
@@ -232,27 +299,35 @@ func (s *InterviewService) TranscribeAudio(
 	clerkUserID, mockID string,
 	audio []byte,
 	mimeType string,
-) (string, error) {
+	longPauseCount int,
+) (domain.TranscriptResult, error) {
 	if clerkUserID == "" {
-		return "", fmt.Errorf("transcribe audio: %w", domain.ErrUnauthorized)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: %w", domain.ErrUnauthorized)
 	}
 	if strings.TrimSpace(mockID) == "" {
-		return "", fmt.Errorf("transcribe audio: %w", domain.ErrValidation)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: %w", domain.ErrValidation)
 	}
 	if len(audio) == 0 {
-		return "", fmt.Errorf("transcribe audio: empty audio: %w", domain.ErrValidation)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: empty audio: %w", domain.ErrValidation)
 	}
 	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
-		return "", fmt.Errorf("transcribe audio: %w", err)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: %w", err)
 	}
 	if _, err := s.store.GetInterviewByMockID(ctx, mockID, clerkUserID); err != nil {
-		return "", fmt.Errorf("transcribe audio: %w", err)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: %w", err)
 	}
-	transcript, err := s.llm.TranscribeAudio(ctx, audio, mimeType)
+	result, err := s.llm.TranscribeAudio(ctx, audio, mimeType)
 	if err != nil {
-		return "", fmt.Errorf("transcribe audio: %w", err)
+		return domain.TranscriptResult{}, fmt.Errorf("transcribe audio: %w", err)
 	}
-	return strings.TrimSpace(transcript), nil
+	result.Transcript = strings.TrimSpace(result.Transcript)
+	if longPauseCount < 0 {
+		longPauseCount = 0
+	} else if longPauseCount > 1000 {
+		longPauseCount = 1000
+	}
+	result.Analysis.LongPauseCount = longPauseCount
+	return result, nil
 }
 
 // ListFeedback returns all answers for an interview the user owns.

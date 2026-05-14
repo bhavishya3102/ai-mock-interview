@@ -83,6 +83,18 @@ export const handlers = [
   http.get(`${BASE}/interviews/:mockId/feedback`, () =>
     HttpResponse.json<ListResponse<UserAnswer>>({ items: SAMPLE_FEEDBACK }),
   ),
+  http.post(`${BASE}/interviews/:mockId/transcribe`, () =>
+    HttpResponse.json({
+      transcript: "um so I built it",
+      analysis: SAMPLE_ANALYSIS,
+    }),
+  ),
 ];
 
-export { SAMPLE_INTERVIEW, SAMPLE_SUMMARY, SAMPLE_FEEDBACK };
+const SAMPLE_ANALYSIS = {
+  fillerCount: 2,
+  wordsPerMinute: 145,
+  longPauseCount: 1,
+};
+
+export { SAMPLE_INTERVIEW, SAMPLE_SUMMARY, SAMPLE_FEEDBACK, SAMPLE_ANALYSIS };

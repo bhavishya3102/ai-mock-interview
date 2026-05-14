@@ -5,8 +5,9 @@ import {
   getInterview,
   listInterviews,
   submitAnswer,
+  transcribeAudio,
 } from "./interviews";
-import { SAMPLE_INTERVIEW, SAMPLE_SUMMARY } from "@/test/msw/handlers";
+import { SAMPLE_ANALYSIS, SAMPLE_INTERVIEW, SAMPLE_SUMMARY } from "@/test/msw/handlers";
 
 describe("api/interviews against MSW", () => {
   it("listInterviews unwraps the items array", async () => {
@@ -49,5 +50,13 @@ describe("api/interviews against MSW", () => {
     const items = await getFeedback(SAMPLE_INTERVIEW.mockId);
     expect(items.length).toBeGreaterThan(0);
     expect(items[0]?.questionIndex).toBe(0);
+  });
+
+  it("transcribeAudio returns transcript plus delivery analysis", async () => {
+    const fakeAudio = new Blob(["fake"], { type: "audio/webm" });
+    const result = await transcribeAudio(SAMPLE_INTERVIEW.mockId, fakeAudio, 1);
+    expect(typeof result.transcript).toBe("string");
+    expect(result.transcript.length).toBeGreaterThan(0);
+    expect(result.analysis).toEqual(SAMPLE_ANALYSIS);
   });
 });

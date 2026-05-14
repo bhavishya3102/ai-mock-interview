@@ -26,6 +26,38 @@ var questionGenSchema = &genai.Schema{
 	PropertyOrdering: []string{"questions"},
 }
 
+// followUpSchema constrains the LLM output for the follow-up judge. An
+// empty followUp string means "good enough — no further probe needed".
+var followUpSchema = &genai.Schema{
+	Type: genai.TypeObject,
+	Properties: map[string]*genai.Schema{
+		"followUp": {Type: genai.TypeString},
+		"reason":   {Type: genai.TypeString},
+	},
+	Required:         []string{"followUp", "reason"},
+	PropertyOrdering: []string{"followUp", "reason"},
+}
+
+// transcribeSchema constrains TranscribeAudio so Gemini returns the verbatim
+// transcript and the speaking-rate estimate. Filler and long-pause counts are
+// no longer LLM-judged: fillers are counted programmatically from the
+// transcript (see CountFillers), and pauses come from client-side VAD.
+// wordsPerMinute is capped at 400 (auctioneer-speed) so a hallucinated huge
+// value can't poison the UI.
+var transcribeSchema = &genai.Schema{
+	Type: genai.TypeObject,
+	Properties: map[string]*genai.Schema{
+		"transcript": {Type: genai.TypeString},
+		"wordsPerMinute": {
+			Type:    genai.TypeInteger,
+			Minimum: genai.Ptr(0.0),
+			Maximum: genai.Ptr(400.0),
+		},
+	},
+	Required:         []string{"transcript", "wordsPerMinute"},
+	PropertyOrdering: []string{"transcript", "wordsPerMinute"},
+}
+
 // answerEvalSchema constrains the LLM output for answer evaluation. The
 // rating is bounded to 1..10 to match the user_answers.rating CHECK constraint.
 var answerEvalSchema = &genai.Schema{

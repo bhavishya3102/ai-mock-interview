@@ -7,8 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +35,8 @@ type fakeSvc struct {
 	getInterviewFunc    func(ctx context.Context, userID, mockID string) (domain.MockInterview, error)
 	submitAnswerFunc    func(ctx context.Context, userID string, in service.SubmitAnswerInput) (domain.UserAnswer, error)
 	listFeedbackFunc    func(ctx context.Context, userID, mockID string) ([]domain.UserAnswer, error)
-	transcribeAudioFunc func(ctx context.Context, userID, mockID string, audio []byte, mimeType string) (string, error)
+	transcribeAudioFunc func(ctx context.Context, userID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
+	judgeFollowUpFunc   func(ctx context.Context, userID string, in service.JudgeFollowUpInput) (string, error)
 }
 
 func (f *fakeSvc) CreateInterview(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error) {
@@ -50,11 +54,17 @@ func (f *fakeSvc) SubmitAnswer(ctx context.Context, userID string, in service.Su
 func (f *fakeSvc) ListFeedback(ctx context.Context, userID, mockID string) ([]domain.UserAnswer, error) {
 	return f.listFeedbackFunc(ctx, userID, mockID)
 }
-func (f *fakeSvc) TranscribeAudio(ctx context.Context, userID, mockID string, audio []byte, mimeType string) (string, error) {
+func (f *fakeSvc) TranscribeAudio(ctx context.Context, userID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error) {
 	if f.transcribeAudioFunc == nil {
+		return domain.TranscriptResult{}, nil
+	}
+	return f.transcribeAudioFunc(ctx, userID, mockID, audio, mimeType, longPauseCount)
+}
+func (f *fakeSvc) JudgeFollowUp(ctx context.Context, userID string, in service.JudgeFollowUpInput) (string, error) {
+	if f.judgeFollowUpFunc == nil {
 		return "", nil
 	}
-	return f.transcribeAudioFunc(ctx, userID, mockID, audio, mimeType)
+	return f.judgeFollowUpFunc(ctx, userID, in)
 }
 
 // withUserID returns a request whose context carries a Clerk user ID — used
@@ -74,6 +84,7 @@ func interviewRouter(h *InterviewHandler) http.Handler {
 	r.Get("/api/v1/interviews/{mockId}", h.Get)
 	r.Post("/api/v1/interviews/{mockId}/answers", h.SubmitAnswer)
 	r.Get("/api/v1/interviews/{mockId}/feedback", h.ListFeedback)
+	r.Post("/api/v1/interviews/{mockId}/transcribe", h.Transcribe)
 	return r
 }
 
@@ -418,6 +429,64 @@ func TestListFeedback_HappyPath(t *testing.T) {
 	require.Equal(t, "great", got.Items[0].Feedback)
 	require.Equal(t, 1, got.Items[1].QuestionIndex)
 	require.Equal(t, "", got.Items[1].UserAnswer)
+}
+
+// --- Transcribe ---
+
+// audioMultipart builds a multipart body with the audio part plus the
+// longPauseCount field, mirroring what the browser's MediaRecorder + VAD
+// produces.
+func audioMultipart(t *testing.T, mimeType string, payload []byte, longPauseCount int) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	hdr := make(textproto.MIMEHeader)
+	hdr.Set("Content-Disposition", `form-data; name="audio"; filename="answer.webm"`)
+	hdr.Set("Content-Type", mimeType)
+	part, err := w.CreatePart(hdr)
+	require.NoError(t, err)
+	_, err = part.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, w.WriteField("longPauseCount", strconv.Itoa(longPauseCount)))
+	require.NoError(t, w.Close())
+	return &buf, w.FormDataContentType()
+}
+
+func TestTranscribe_HappyPath_IncludesAnalysis(t *testing.T) {
+	svc := &fakeSvc{
+		transcribeAudioFunc: func(_ context.Context, _, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error) {
+			require.Equal(t, "mock-abc", mockID)
+			require.Equal(t, "audio/webm", mimeType)
+			require.NotEmpty(t, audio)
+			require.Equal(t, 2, longPauseCount, "handler must forward longPauseCount form field")
+			return domain.TranscriptResult{
+				Transcript: "um so I uh built it",
+				Analysis: domain.SpeechAnalysis{
+					FillerCount:    3,
+					WordsPerMinute: 118,
+					LongPauseCount: longPauseCount,
+				},
+			}, nil
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	body, contentType := audioMultipart(t, "audio/webm", []byte("fake-opus-bytes"), 2)
+	req := withUserID(
+		httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/transcribe", body),
+		"user_1",
+	)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got transcribeResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "um so I uh built it", got.Transcript)
+	require.Equal(t, 3, got.Analysis.FillerCount)
+	require.Equal(t, 118, got.Analysis.WordsPerMinute)
+	require.Equal(t, 2, got.Analysis.LongPauseCount)
 }
 
 // --- error mapping table (sanity check on the central mapper) ---

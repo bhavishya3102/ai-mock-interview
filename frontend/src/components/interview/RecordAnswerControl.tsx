@@ -1,12 +1,24 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import { CheckCircle2, Loader2, Mic, Square, RotateCcw } from "lucide-react";
+import { CheckCircle2, ChevronRight, Loader2, Mic, Square, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAudioRecorder } from "@/hooks/useAudioRecorder";
-import { useSubmitAnswer, useTranscribeAudio } from "@/hooks/useInterviewMutations";
+import {
+  useJudgeFollowUp,
+  useSubmitAnswer,
+  useTranscribeAudio,
+} from "@/hooks/useInterviewMutations";
 import { useToast } from "@/hooks/use-toast";
 import { useSessionStore } from "@/store/sessionStore";
 import { ApiError } from "@/api/client";
 import { cn } from "@/lib/cn";
+import type { FollowUpTurn, SpeechAnalysis } from "@/api/interviews";
+import { SpeechAnalysisCard } from "@/components/interview/SpeechAnalysisCard";
+
+// Mirrors the backend's MaxFollowUpsPerQuestion. Defensive client-side cap —
+// the backend already enforces it, but we use this to disable the Record
+// button once the cap is hit so the UI doesn't promise another turn that
+// the server will refuse.
+const MAX_FOLLOW_UPS = 2;
 
 interface RecordAnswerControlProps {
   mockId: string;
@@ -23,6 +35,14 @@ function formatElapsed(totalSeconds: number): string {
   return `${m}:${s}`;
 }
 
+function composeUserAnswer(main: string, turns: FollowUpTurn[]): string {
+  let s = main.trim();
+  for (const t of turns) {
+    s += `\n\n[Follow-up: ${t.question.trim()}]\n${t.answer.trim()}`;
+  }
+  return s;
+}
+
 export function RecordAnswerControl({
   mockId,
   questionIndex,
@@ -31,31 +51,39 @@ export function RecordAnswerControl({
     useAudioRecorder();
 
   const transcribe = useTranscribeAudio();
+  const judge = useJudgeFollowUp();
   const submit = useSubmitAnswer();
   const { toast } = useToast();
 
-  const transcript = useSessionStore((s) => s.transcript);
+  // The audio-recorder pipeline writes the latest transcribed snippet here.
+  // We read it to display interim state, but we never auto-submit from it —
+  // a separate state machine below owns the conversation.
   const setTranscript = useSessionStore((s) => s.setTranscript);
 
+  // Conversation state for the current main question.
+  const [mainAnswer, setMainAnswer] = useState<string>("");
+  const [turns, setTurns] = useState<FollowUpTurn[]>([]);
+  const [currentFollowUp, setCurrentFollowUp] = useState<string | null>(null);
   const [showSavedHint, setShowSavedHint] = useState(false);
-  const [saveRetryKey, setSaveRetryKey] = useState(0);
-  const triggeredRef = useRef(false);
+  // Delivery analysis of the most recent recording. Cleared per-question
+  // because metrics for question N don't apply to question N+1.
+  const [latestAnalysis, setLatestAnalysis] = useState<SpeechAnalysis | null>(null);
 
-  const trimmed = transcript.trim();
-  const wordCount = trimmed ? trimmed.split(/\s+/).filter(Boolean).length : 0;
-
-  const submitResetRef = useRef(submit.reset);
-  submitResetRef.current = submit.reset;
-  const transcribeResetRef = useRef(transcribe.reset);
-  transcribeResetRef.current = transcribe.reset;
-
-  // Reset all transient state when the active question changes — otherwise a
-  // half-completed transcript from question 1 leaks into question 2.
+  // Reset every transient piece of state when the active question changes.
+  // Without this, partway-completed follow-ups from question N leak into N+1.
   useEffect(() => {
-    triggeredRef.current = false;
-    submitResetRef.current();
-    transcribeResetRef.current();
+    setMainAnswer("");
+    setTurns([]);
+    setCurrentFollowUp(null);
     setShowSavedHint(false);
+    setLatestAnalysis(null);
+    setTranscript("");
+    judge.reset();
+    submit.reset();
+    transcribe.reset();
+    // We intentionally exclude the mutation refs — they're stable per render
+    // and including them would re-run reset on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mockId, questionIndex]);
 
   useEffect(() => {
@@ -64,52 +92,81 @@ export function RecordAnswerControl({
     return () => window.clearTimeout(t);
   }, [showSavedHint]);
 
-  // Auto-submit once we have a non-empty transcript and we're not still busy
-  // capturing or transcribing audio. Keeps the existing "stop, save, move on"
-  // flow intact — just sourced from MediaRecorder + Gemini instead of Web
-  // Speech.
-  useEffect(() => {
-    if (isRecording || transcribe.isPending) {
-      triggeredRef.current = false;
+  const isBusy =
+    isRecording || transcribe.isPending || judge.isPending || submit.isPending;
+  const capReached = turns.length >= MAX_FOLLOW_UPS;
+  const phase: "idle" | "main" | "follow-up" | "finalized" = showSavedHint
+    ? "finalized"
+    : !mainAnswer
+      ? "idle"
+      : currentFollowUp
+        ? "follow-up"
+        : "main";
+
+  // submitRef lets the async callbacks read the latest mutation handle without
+  // re-creating closures every render.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+
+  async function finalize(main: string, turnsList: FollowUpTurn[]): Promise<void> {
+    try {
+      await submitRef.current.mutateAsync({
+        mockId,
+        payload: {
+          questionIndex,
+          userAnswer: composeUserAnswer(main, turnsList),
+        },
+      });
+      setShowSavedHint(true);
+      toast({
+        title: "Answer saved",
+        description: "Open Feedback after the interview to see your rating.",
+      });
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : "Could not save answer.";
+      toast({ title: "Save failed", description: message, variant: "destructive" });
+    }
+  }
+
+  async function askForNextFollowUp(main: string, turnsList: FollowUpTurn[]): Promise<void> {
+    if (turnsList.length >= MAX_FOLLOW_UPS) {
+      // Defensive — backend would return "" anyway, but skip the round trip.
+      await finalize(main, turnsList);
       return;
     }
-    if (triggeredRef.current) return;
-    if (trimmed.length < 1) return;
-
-    triggeredRef.current = true;
-    submit.mutate(
-      { mockId, payload: { questionIndex, userAnswer: trimmed } },
-      {
-        onSuccess: () => {
-          setShowSavedHint(true);
-          toast({
-            title: "Answer saved",
-            description: "Open Feedback after the interview to see your rating.",
-          });
-          setTranscript("");
+    try {
+      const result = await judge.mutateAsync({
+        mockId,
+        payload: {
+          questionIndex,
+          mainAnswer: main,
+          priorTurns: turnsList,
         },
-        onError: (err) => {
-          const message = err instanceof ApiError ? err.message : "Could not save answer.";
-          toast({ title: "Save failed", description: message, variant: "destructive" });
-        },
-      },
-    );
-  }, [
-    isRecording,
-    transcribe.isPending,
-    trimmed,
-    mockId,
-    questionIndex,
-    saveRetryKey,
-    submit,
-    toast,
-    setTranscript,
-  ]);
+      });
+      const next = result.followUp.trim();
+      if (!next) {
+        await finalize(main, turnsList);
+        return;
+      }
+      setCurrentFollowUp(next);
+      setTranscript("");
+    } catch (err) {
+      // Don't block the user on a judge failure — finalize what we have.
+      const message =
+        err instanceof ApiError ? err.message : "Could not judge follow-up.";
+      toast({
+        title: "Skipping follow-up",
+        description: `${message} — saving your current answer instead.`,
+        variant: "destructive",
+      });
+      await finalize(main, turnsList);
+    }
+  }
 
-  const handleStartStop = async () => {
+  async function handleStartStop(): Promise<void> {
     if (isRecording) {
-      const blob = await stop();
-      if (!blob) {
+      const recording = await stop();
+      if (!recording) {
         toast({
           title: "Nothing was captured",
           description: "We didn't pick up any audio. Try recording again.",
@@ -117,53 +174,117 @@ export function RecordAnswerControl({
         });
         return;
       }
+      let text = "";
       try {
-        const result = await transcribe.mutateAsync({ mockId, audio: blob });
-        const text = result.transcript.trim();
-        if (!text) {
-          toast({
-            title: "No speech detected",
-            description: "We couldn't hear anything intelligible. Speak closer to the mic and try again.",
-            variant: "destructive",
-          });
-          return;
-        }
-        setTranscript(text);
+        const result = await transcribe.mutateAsync({
+          mockId,
+          audio: recording.blob,
+          longPauseCount: recording.longPauseCount,
+        });
+        text = result.transcript.trim();
+        setLatestAnalysis(result.analysis);
       } catch (err) {
-        const message = err instanceof ApiError ? err.message : "Could not transcribe audio.";
+        const message =
+          err instanceof ApiError ? err.message : "Could not transcribe audio.";
         toast({ title: "Transcription failed", description: message, variant: "destructive" });
+        return;
+      }
+      if (!text) {
+        toast({
+          title: "No speech detected",
+          description: "We couldn't hear anything intelligible. Speak closer to the mic and try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (!mainAnswer) {
+        // First recording for this question — this is the main answer.
+        setMainAnswer(text);
+        setTranscript(text);
+        await askForNextFollowUp(text, []);
+      } else if (currentFollowUp) {
+        // Recording is the candidate's reply to the current follow-up.
+        const nextTurns: FollowUpTurn[] = [
+          ...turns,
+          { question: currentFollowUp, answer: text },
+        ];
+        setTurns(nextTurns);
+        setCurrentFollowUp(null);
+        setTranscript(text);
+        await askForNextFollowUp(mainAnswer, nextTurns);
+      } else {
+        // No active follow-up but mainAnswer exists — treat as a re-record of
+        // the main answer (user used the Clear button, or hit Record again).
+        setMainAnswer(text);
+        setTurns([]);
+        setTranscript(text);
+        await askForNextFollowUp(text, []);
       }
       return;
     }
 
-    triggeredRef.current = false;
+    judge.reset();
     submit.reset();
     transcribe.reset();
     await start();
-  };
+  }
+
+  async function handleMoveOn(): Promise<void> {
+    if (!mainAnswer || isBusy) return;
+    // Drop any pending follow-up question — user opted out of answering it.
+    setCurrentFollowUp(null);
+    await finalize(mainAnswer, turns);
+  }
+
+  function handleClear(): void {
+    setMainAnswer("");
+    setTurns([]);
+    setCurrentFollowUp(null);
+    setShowSavedHint(false);
+    setLatestAnalysis(null);
+    setTranscript("");
+    judge.reset();
+    submit.reset();
+    transcribe.reset();
+  }
 
   const supportMessage =
     !isSupported && !recorderError
       ? "Audio recording isn't available in this browser. Try Chrome, Firefox, or Edge."
       : null;
 
-  const isBusy = isRecording || transcribe.isPending || submit.isPending;
+  const recordDisabled =
+    !isSupported || transcribe.isPending || judge.isPending || submit.isPending ||
+    (phase === "main" && capReached);
+
+  const recordButtonLabel = !mainAnswer
+    ? "Record answer"
+    : currentFollowUp
+      ? "Record follow-up answer"
+      : "Re-record main answer";
 
   return (
     <div className="rounded-2xl border bg-card p-5 shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-            Your answer
+            {phase === "follow-up" ? "Follow-up" : "Your answer"}
           </p>
           <p className="mt-1 text-sm text-muted-foreground">
             {isRecording
               ? "Recording — speak clearly. Press Stop when you're finished."
               : transcribe.isPending
                 ? "Transcribing your answer…"
-                : transcript
-                  ? "Re-record to replace this answer, or clear and try again. Saving runs automatically."
-                  : "Press Record answer, speak, then Stop. Your transcript appears once we process the audio."}
+                : judge.isPending
+                  ? "Interviewer is thinking…"
+                  : submit.isPending
+                    ? "Saving your answer…"
+                    : phase === "follow-up"
+                      ? "The interviewer asked a follow-up. Record your reply, or click Move on to skip."
+                      : mainAnswer
+                        ? "Saved your main answer. Awaiting next step."
+                        : "Press Record answer, speak, then Stop. Your transcript appears once we process the audio."}
           </p>
           {isRecording ? (
             <div
@@ -179,18 +300,13 @@ export function RecordAnswerControl({
           ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {transcript && !isBusy ? (
+          {mainAnswer && !isBusy ? (
             <Button
               type="button"
               variant="ghost"
               size="icon"
-              onClick={() => {
-                setTranscript("");
-                submit.reset();
-                transcribe.reset();
-                triggeredRef.current = false;
-              }}
-              aria-label="Clear transcript"
+              onClick={handleClear}
+              aria-label="Clear and start over"
             >
               <RotateCcw className="h-4 w-4" />
             </Button>
@@ -201,7 +317,7 @@ export function RecordAnswerControl({
               void handleStartStop();
             }}
             variant={isRecording ? "destructive" : "default"}
-            disabled={!isSupported || transcribe.isPending || submit.isPending}
+            disabled={recordDisabled}
             aria-pressed={isRecording}
             className={cn(
               isRecording &&
@@ -211,6 +327,10 @@ export function RecordAnswerControl({
             {transcribe.isPending ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin" /> Transcribing
+              </>
+            ) : judge.isPending ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" /> Thinking
               </>
             ) : submit.isPending ? (
               <>
@@ -222,76 +342,100 @@ export function RecordAnswerControl({
               </>
             ) : (
               <>
-                <Mic className="h-4 w-4" /> Record answer
+                <Mic className="h-4 w-4" /> {recordButtonLabel}
               </>
             )}
           </Button>
         </div>
       </div>
 
-      <div
-        className={cn(
-          "mt-5 min-h-[120px] rounded-lg border border-dashed bg-secondary/40 p-4 text-sm leading-relaxed transition-colors",
-          isRecording && "border-destructive/40 bg-destructive/[0.04] dark:bg-destructive/10",
-        )}
-      >
-        {transcribe.isPending ? (
-          <p className="flex items-center gap-2 italic text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Transcribing your answer — this usually takes a few seconds.
+      {mainAnswer ? (
+        <div className="mt-5 rounded-lg border bg-secondary/30 p-4 text-sm">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+            Main answer
           </p>
-        ) : transcript ? (
-          <p className="whitespace-pre-wrap">{transcript}</p>
-        ) : isRecording ? (
-          <p className="italic text-muted-foreground">
-            Listening… your transcript will appear after you press Stop.
-          </p>
-        ) : (
-          <p className="italic text-muted-foreground">
-            Your transcript will show up here after you record an answer.
-          </p>
-        )}
-      </div>
-
-      {transcript && !isBusy ? (
-        <p className="mt-2 text-xs text-muted-foreground">
-          {wordCount} word{wordCount === 1 ? "" : "s"} · {trimmed.length} characters
-        </p>
+          <p className="mt-2 whitespace-pre-wrap leading-relaxed">{mainAnswer}</p>
+        </div>
       ) : null}
 
-      {submit.isPending ? (
-        <p className="mt-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          Saving your answer…
-        </p>
+      {latestAnalysis ? <SpeechAnalysisCard analysis={latestAnalysis} /> : null}
+
+      {turns.map((t, i) => (
+        <div
+          key={`turn-${i}`}
+          className="mt-3 rounded-lg border bg-secondary/30 p-4 text-sm"
+        >
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+            Follow-up {i + 1}
+          </p>
+          <p className="mt-2 font-medium">{t.question}</p>
+          <p className="mt-1 whitespace-pre-wrap leading-relaxed text-muted-foreground">
+            {t.answer}
+          </p>
+        </div>
+      ))}
+
+      {currentFollowUp ? (
+        <div className="mt-3 rounded-lg border border-amber-300/60 bg-amber-50/70 p-4 text-sm dark:border-amber-400/30 dark:bg-amber-950/40">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-amber-900 dark:text-amber-200">
+            Interviewer follow-up
+          </p>
+          <p className="mt-2 font-medium text-amber-950 dark:text-amber-50">
+            {currentFollowUp}
+          </p>
+        </div>
       ) : null}
 
-      {showSavedHint ? (
-        <p className="mt-2 flex items-center gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
-          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-          Saved — move to the next question or keep practicing here.
-        </p>
+      {!mainAnswer ? (
+        <div
+          className={cn(
+            "mt-5 min-h-[120px] rounded-lg border border-dashed bg-secondary/40 p-4 text-sm leading-relaxed transition-colors",
+            isRecording && "border-destructive/40 bg-destructive/[0.04] dark:bg-destructive/10",
+          )}
+        >
+          {transcribe.isPending ? (
+            <p className="flex items-center gap-2 italic text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Transcribing your answer — this usually takes a few seconds.
+            </p>
+          ) : isRecording ? (
+            <p className="italic text-muted-foreground">
+              Listening… your transcript will appear after you press Stop.
+            </p>
+          ) : (
+            <p className="italic text-muted-foreground">
+              Your transcript will show up here after you record an answer.
+            </p>
+          )}
+        </div>
       ) : null}
 
-      {submit.isError && trimmed.length >= 1 && !isRecording && !transcribe.isPending ? (
-        <div className="mt-3 flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3">
-          <p className="text-sm text-destructive">
-            Your answer did not save. Check your connection or sign-in, then try again.
+      {mainAnswer && !showSavedHint ? (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md border bg-card p-3">
+          <p className="text-xs text-muted-foreground">
+            {capReached
+              ? `Cap reached (${MAX_FOLLOW_UPS} follow-ups). Click Move on to save.`
+              : `${turns.length} of ${MAX_FOLLOW_UPS} possible follow-ups used.`}
           </p>
           <Button
             type="button"
             variant="secondary"
             size="sm"
-            className="self-start"
             onClick={() => {
-              submit.reset();
-              triggeredRef.current = false;
-              setSaveRetryKey((k) => k + 1);
+              void handleMoveOn();
             }}
+            disabled={isBusy}
           >
-            Try saving again
+            Move on <ChevronRight className="h-4 w-4" />
           </Button>
         </div>
+      ) : null}
+
+      {showSavedHint ? (
+        <p className="mt-3 flex items-center gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+          Saved — move to the next question or keep practicing here.
+        </p>
       ) : null}
 
       {recorderError ? (
