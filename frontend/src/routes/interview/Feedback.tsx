@@ -4,6 +4,7 @@ import { ArrowLeft, Home, Loader2, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { FeedbackItem } from "@/components/interview/FeedbackItem";
+import { CoachReportCard } from "@/components/interview/CoachReportCard";
 import { EmptyFeedback } from "@/components/feedback/EmptyFeedback";
 import { useInterviewFeedback } from "@/hooks/useInterview";
 import { cn } from "@/lib/cn";
@@ -84,6 +85,11 @@ export default function Feedback(): ReactElement {
           items.map((item) => <FeedbackItem key={item.questionIndex} item={item} />)
         )}
       </section>
+
+      {/* Coach report only makes sense once at least one answer has been
+          evaluated; rendering it on an empty interview would surface a
+          Generate button that the backend would correctly reject. */}
+      {items.length > 0 ? <CoachReportCard mockId={mockId} /> : null}
     </PageContainer>
   );
 }

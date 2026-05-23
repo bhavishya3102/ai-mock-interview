@@ -1,5 +1,6 @@
 import { http, HttpResponse } from "msw";
 import type {
+  CoachReport,
   Interview,
   InterviewSummary,
   ListResponse,
@@ -117,6 +118,42 @@ export const handlers = [
     }),
   ),
   http.delete(`${BASE}/resume`, () => new HttpResponse(null, { status: 204 })),
+  // Coach report endpoints. Default handlers cover the happy path; tests
+  // that need 404/error variants override via server.use(...) per test.
+  http.get(`${BASE}/interviews/:mockId/coach-report`, ({ params }) => {
+    if (params["mockId"] !== SAMPLE_INTERVIEW.mockId) {
+      return HttpResponse.json(
+        { error: { code: "not_found", message: "resource not found" } },
+        { status: 404 },
+      );
+    }
+    return HttpResponse.json<CoachReport>(SAMPLE_COACH_REPORT);
+  }),
+  http.post(`${BASE}/interviews/:mockId/coach-report`, () =>
+    HttpResponse.json<CoachReport>(SAMPLE_COACH_REPORT, { status: 201 }),
+  ),
+  http.post(`${BASE}/interviews/:mockId/coach-report/stream`, () => {
+    // Build a minimal SSE response stream: two chunk events then done.
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(`event: chunk\ndata: {"text":"## Overall Performance\\n"}\n\n`));
+        controller.enqueue(encoder.encode(`event: chunk\ndata: {"text":"streamed body"}\n\n`));
+        controller.enqueue(
+          encoder.encode(
+            `event: done\ndata: {"mockId":"${SAMPLE_INTERVIEW.mockId}","tokensUsed":1500,"model":"gemini-test","createdAt":"2026-05-23T10:00:00Z"}\n\n`,
+          ),
+        );
+        controller.close();
+      },
+    });
+    return new HttpResponse(body, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+      },
+    });
+  }),
 ];
 
 const SAMPLE_ANALYSIS = {
@@ -125,4 +162,12 @@ const SAMPLE_ANALYSIS = {
   longPauseCount: 1,
 };
 
-export { SAMPLE_INTERVIEW, SAMPLE_SUMMARY, SAMPLE_FEEDBACK, SAMPLE_ANALYSIS };
+const SAMPLE_COACH_REPORT: CoachReport = {
+  mockId: SAMPLE_INTERVIEW.mockId,
+  content: "## Overall Performance\nYou did well on the backend questions.",
+  tokensUsed: 1500,
+  model: "gemini-test",
+  createdAt: "2026-05-23T10:00:00Z",
+};
+
+export { SAMPLE_INTERVIEW, SAMPLE_SUMMARY, SAMPLE_FEEDBACK, SAMPLE_ANALYSIS, SAMPLE_COACH_REPORT };

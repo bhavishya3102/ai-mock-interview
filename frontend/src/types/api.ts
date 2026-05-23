@@ -62,3 +62,11 @@ export interface ListResponse<T> {
 export interface ApiErrorBody {
   error: { code: string; message: string };
 }
+
+export interface CoachReport {
+  mockId: ID;
+  content: string;
+  tokensUsed: number;
+  model: string;
+  createdAt: string;
+}
