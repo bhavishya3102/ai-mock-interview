@@ -2,7 +2,6 @@ package http
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 )
@@ -16,23 +15,19 @@ import (
 // flushes immediately so proxies and the browser surface the chunk without
 // buffering. WriteEvent returns the underlying write error so the caller
 // can detect client disconnects and abort early.
+//
+// Flush is performed through http.NewResponseController so middleware
+// wrappers (statusRecorder, recoverer) that don't themselves implement
+// http.Flusher are unwrapped automatically — a direct `w.(http.Flusher)`
+// assertion would fail against the chi+statusRecorder middleware chain.
 type sseWriter struct {
 	w           http.ResponseWriter
-	flusher     http.Flusher
+	rc          *http.ResponseController
 	headersSent bool
 }
 
-// errResponseNotFlushable is returned by newSSEWriter when the underlying
-// ResponseWriter does not implement http.Flusher. Production servers always
-// do; this guards against an httptest setup that strips the interface.
-var errResponseNotFlushable = errors.New("sse: response writer is not a Flusher")
-
-func newSSEWriter(w http.ResponseWriter) (*sseWriter, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return nil, errResponseNotFlushable
-	}
-	return &sseWriter{w: w, flusher: flusher}, nil
+func newSSEWriter(w http.ResponseWriter) *sseWriter {
+	return &sseWriter{w: w, rc: http.NewResponseController(w)}
 }
 
 // writeHeaders sets the SSE response headers and writes the 200 status.
@@ -66,7 +61,13 @@ func (s *sseWriter) WriteEvent(event string, data any) error {
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, payload); err != nil {
 		return fmt.Errorf("sse write: %w", err)
 	}
-	s.flusher.Flush()
+	// Flush failure is rare in production but possible if the underlying
+	// writer doesn't support it (e.g. an exotic test recorder). Surface so
+	// the handler can stop generating chunks rather than buffer them
+	// indefinitely.
+	if err := s.rc.Flush(); err != nil {
+		return fmt.Errorf("sse flush: %w", err)
+	}
 	return nil
 }
 

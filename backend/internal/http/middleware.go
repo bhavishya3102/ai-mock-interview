@@ -48,6 +48,13 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Unwrap exposes the wrapped ResponseWriter so http.NewResponseController
+// can walk past this middleware to reach the underlying Flusher / Hijacker
+// / etc. Required for SSE streaming (sse.go) to find the real Flusher.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // requestIDMiddleware attaches an X-Request-ID — accepts client-supplied if
 // present, otherwise generates a UUID.
 func requestIDMiddleware(next http.Handler) http.Handler {

@@ -515,11 +515,7 @@ func (h *InterviewHandler) StreamCoachReport(w http.ResponseWriter, r *http.Requ
 
 	mockID := chi.URLParam(r, "mockId")
 
-	sse, err := newSSEWriter(w)
-	if err != nil {
-		h.respondErr(w, r, err, nil)
-		return
-	}
+	sse := newSSEWriter(w)
 
 	report, svcErr := h.svc.StreamCoachReport(r.Context(), userID, mockID, func(text string) error {
 		return sse.WriteEvent("chunk", streamChunkEvent{Text: text})
