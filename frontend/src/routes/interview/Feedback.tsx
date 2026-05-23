@@ -1,6 +1,6 @@
-import type { ReactElement } from "react";
+import { useState, type ReactElement, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, Home, Loader2, Trophy } from "lucide-react";
+import { ArrowLeft, Home, Loader2, MessageSquare, Sparkles, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { FeedbackItem } from "@/components/interview/FeedbackItem";
@@ -9,9 +9,15 @@ import { EmptyFeedback } from "@/components/feedback/EmptyFeedback";
 import { useInterviewFeedback } from "@/hooks/useInterview";
 import { cn } from "@/lib/cn";
 
+type FeedbackTab = "feedback" | "coach";
+
 export default function Feedback(): ReactElement {
   const { mockId } = useParams<{ mockId: string }>();
   const { data, isLoading, isError, error } = useInterviewFeedback(mockId);
+  // Tab state is local — tabs are a presentation concern. URL sync is
+  // intentionally not wired so a refresh keeps the user on the default
+  // (Feedback) tab; users land on the coach report intentionally.
+  const [tab, setTab] = useState<FeedbackTab>("feedback");
 
   if (!mockId) {
     return (
@@ -31,6 +37,8 @@ export default function Feedback(): ReactElement {
   const summaryTone =
     average >= 8 ? "emerald" : average >= 5 ? "amber" : items.length === 0 ? "muted" : "rose";
 
+  const hasItems = items.length > 0;
+
   return (
     <PageContainer>
       <Button asChild variant="ghost" size="sm" className="mb-6">
@@ -42,14 +50,14 @@ export default function Feedback(): ReactElement {
       <header className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-            Feedback
+            Review
           </p>
           <h1 className="mt-2 font-display text-4xl font-semibold tracking-tight md:text-5xl">
             How you did
           </h1>
           <p className="mt-3 max-w-xl text-sm text-muted-foreground">
-            Below is a per-question breakdown with your answer, the reference answer, and tailored
-            coaching. Expand a card to review the details.
+            Per-question breakdown plus a personalised coach report that synthesises everything into
+            one narrative.
           </p>
         </div>
         <Button asChild variant="ghost">
@@ -59,7 +67,7 @@ export default function Feedback(): ReactElement {
         </Button>
       </header>
 
-      {items.length > 0 ? (
+      {hasItems ? (
         <SummaryCard
           average={average}
           total={items.length}
@@ -70,27 +78,86 @@ export default function Feedback(): ReactElement {
         />
       ) : null}
 
-      <section className="mt-8 space-y-3">
-        {isLoading ? (
-          <div className="flex items-center gap-2 rounded-2xl border border-dashed bg-card/40 p-12 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" /> Loading feedback
-          </div>
-        ) : isError ? (
-          <div className="rounded-2xl border border-destructive/40 bg-destructive/5 p-12 text-sm text-destructive">
-            {error.message || "Could not load feedback."}
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyFeedback mockId={mockId} />
-        ) : (
-          items.map((item) => <FeedbackItem key={item.questionIndex} item={item} />)
-        )}
-      </section>
+      {hasItems ? (
+        <TabBar tab={tab} onSelect={setTab} />
+      ) : null}
 
-      {/* Coach report only makes sense once at least one answer has been
-          evaluated; rendering it on an empty interview would surface a
-          Generate button that the backend would correctly reject. */}
-      {items.length > 0 ? <CoachReportCard mockId={mockId} /> : null}
+      {/* When there are no answers yet there's no useful content for the
+          coach tab — collapse the page back to the original single-section
+          layout and skip tabs entirely. */}
+      {!hasItems ? (
+        <section className="mt-8 space-y-3">
+          {isLoading ? (
+            <div className="flex items-center gap-2 rounded-2xl border border-dashed bg-card/40 p-12 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading feedback
+            </div>
+          ) : isError ? (
+            <div className="rounded-2xl border border-destructive/40 bg-destructive/5 p-12 text-sm text-destructive">
+              {error.message || "Could not load feedback."}
+            </div>
+          ) : (
+            <EmptyFeedback mockId={mockId} />
+          )}
+        </section>
+      ) : tab === "feedback" ? (
+        <section role="tabpanel" aria-labelledby="tab-feedback" className="mt-6 space-y-3">
+          {items.map((item) => (
+            <FeedbackItem key={item.questionIndex} item={item} />
+          ))}
+        </section>
+      ) : (
+        <section role="tabpanel" aria-labelledby="tab-coach" className="mt-6">
+          <CoachReportCard mockId={mockId} />
+        </section>
+      )}
     </PageContainer>
+  );
+}
+
+interface TabBarProps {
+  tab: FeedbackTab;
+  onSelect: (tab: FeedbackTab) => void;
+}
+
+function TabBar({ tab, onSelect }: TabBarProps): ReactElement {
+  return (
+    <div role="tablist" aria-label="Review sections" className="mt-8 border-b">
+      <nav className="-mb-px flex gap-1 overflow-x-auto">
+        <TabButton id="tab-feedback" active={tab === "feedback"} onClick={() => onSelect("feedback")}>
+          <MessageSquare className="h-4 w-4" /> Feedback
+        </TabButton>
+        <TabButton id="tab-coach" active={tab === "coach"} onClick={() => onSelect("coach")}>
+          <Sparkles className="h-4 w-4" /> AI Coach Report
+        </TabButton>
+      </nav>
+    </div>
+  );
+}
+
+interface TabButtonProps {
+  id: string;
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}
+
+function TabButton({ id, active, onClick, children }: TabButtonProps): ReactElement {
+  return (
+    <button
+      id={id}
+      role="tab"
+      type="button"
+      aria-selected={active}
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-2 whitespace-nowrap border-b-2 px-4 py-3 text-sm font-medium transition-colors",
+        active
+          ? "border-primary text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

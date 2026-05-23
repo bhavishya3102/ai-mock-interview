@@ -24,7 +24,7 @@ export function InterviewCard({ interview }: InterviewCardProps): ReactElement {
         <div className="flex items-center gap-2">
           <Button asChild variant="outline" size="sm" className="flex-1">
             <Link to={`/interview/${interview.mockId}/feedback`}>
-              <MessageSquare className="h-4 w-4" /> Feedback
+              <MessageSquare className="h-4 w-4" /> Feedback / AI Career Coach
             </Link>
           </Button>
           <Button asChild size="sm" className="flex-1">
