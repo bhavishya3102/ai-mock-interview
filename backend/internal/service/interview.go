@@ -39,6 +39,7 @@ type LLMClient interface {
 	ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error)
 	JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error)
 	GenerateCoachReport(ctx context.Context, in domain.CoachReportSeed) (content string, tokensUsed int, err error)
+	GenerateCoachReportStream(ctx context.Context, in domain.CoachReportSeed, onChunk func(text string) error) (tokensUsed int, err error)
 	Model() string
 }
 
@@ -514,6 +515,106 @@ func (s *InterviewService) GenerateCoachReport(
 	saved, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
 	if err != nil {
 		return domain.CoachReport{}, fmt.Errorf("generate coach report readback: %w", err)
+	}
+	return saved, nil
+}
+
+// StreamCoachReport is the streaming variant of GenerateCoachReport. Each
+// model-produced chunk is forwarded to onChunk as it arrives; the persisted
+// report (with model + tokens + DB-assigned timestamp) is returned once the
+// stream completes.
+//
+// Cached-hit behavior: if a report already exists for mockID, the full
+// stored content is emitted as a SINGLE onChunk call before returning the
+// cached row. No LLM call, no token spend — from the caller's perspective
+// the contract is identical, only the wall-clock latency differs.
+//
+// If onChunk returns an error mid-stream, generation aborts and that error
+// is returned wrapped. The buffered partial content is NOT persisted — a
+// half-written report is useless to the candidate.
+func (s *InterviewService) StreamCoachReport(
+	ctx context.Context,
+	clerkUserID string,
+	mockID string,
+	onChunk func(text string) error,
+) (domain.CoachReport, error) {
+	if clerkUserID == "" {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", domain.ErrUnauthorized)
+	}
+	if strings.TrimSpace(mockID) == "" {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", domain.ErrValidation)
+	}
+	if onChunk == nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: nil onChunk: %w", domain.ErrValidation)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+
+	// Cached hit: emit full content as a single chunk and return early.
+	if existing, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID); err == nil {
+		if cbErr := onChunk(existing.Content); cbErr != nil {
+			return domain.CoachReport{}, fmt.Errorf("stream coach report: cached chunk callback: %w", cbErr)
+		}
+		return existing, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+
+	mi, err := s.store.GetInterviewByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+	answers, err := s.store.ListAnswersByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+	if len(answers) == 0 {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: no answers submitted: %w", domain.ErrValidation)
+	}
+
+	// Buffer chunks server-side for the final persist; forward each to the
+	// caller's onChunk. A callback failure aborts without persisting.
+	var buf strings.Builder
+	tokens, err := s.llm.GenerateCoachReportStream(
+		ctx,
+		domain.CoachReportSeed{
+			JobPosition:     mi.JobPosition,
+			YearsExperience: mi.YearsExperience,
+			Answers:         answers,
+		},
+		func(chunk string) error {
+			buf.WriteString(chunk)
+			return onChunk(chunk)
+		},
+	)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+
+	cr := domain.CoachReport{
+		MockID:     mockID,
+		Content:    buf.String(),
+		TokensUsed: tokens,
+		Model:      s.llm.Model(),
+	}
+	if err := s.store.InsertCoachReport(ctx, cr); err != nil {
+		// Race with a concurrent generator: another caller won the insert.
+		// Return the winning row; the chunks we already streamed remain
+		// meaningful to the client (same prompt, similar content).
+		if errors.Is(err, domain.ErrConflict) {
+			winner, fetchErr := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+			if fetchErr != nil {
+				return domain.CoachReport{}, fmt.Errorf("stream coach report after race: %w", fetchErr)
+			}
+			return winner, nil
+		}
+		return domain.CoachReport{}, fmt.Errorf("stream coach report: %w", err)
+	}
+
+	saved, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("stream coach report readback: %w", err)
 	}
 	return saved, nil
 }

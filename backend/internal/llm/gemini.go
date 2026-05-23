@@ -240,6 +240,50 @@ func (c *Client) JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (str
 	return out.FollowUp, nil
 }
 
+// GenerateCoachReportStream is the streaming variant of GenerateCoachReport.
+// Each model-produced chunk is passed to onChunk as it arrives; the total
+// token count from the final UsageMetadata is returned once the stream
+// closes cleanly.
+//
+// If onChunk returns a non-nil error, streaming aborts immediately with
+// that error wrapped — the caller is the typical "client disconnected,
+// stop spending tokens" path. The returned token count in that case is
+// 0 and the error is NOT tagged ErrLLM (it is a transport failure).
+//
+// Empty chunks (the SDK occasionally emits keepalive responses with no
+// text but with UsageMetadata) are not forwarded to onChunk.
+func (c *Client) GenerateCoachReportStream(
+	ctx context.Context,
+	in domain.CoachReportSeed,
+	onChunk func(text string) error,
+) (int, error) {
+	cfg := &genai.GenerateContentConfig{
+		Temperature: genai.Ptr[float32](0.7),
+		TopP:        genai.Ptr[float32](0.95),
+	}
+
+	var tokens int
+	for resp, iterErr := range c.sdk.Models.GenerateContentStream(
+		ctx,
+		c.model,
+		genai.Text(buildCoachReportPrompt(in)),
+		cfg,
+	) {
+		if iterErr != nil {
+			return 0, fmt.Errorf("gemini stream coach report: %w", errors.Join(domain.ErrLLM, iterErr))
+		}
+		if text := resp.Text(); text != "" {
+			if err := onChunk(text); err != nil {
+				return 0, fmt.Errorf("gemini stream coach report: chunk callback: %w", err)
+			}
+		}
+		if resp.UsageMetadata != nil {
+			tokens = int(resp.UsageMetadata.TotalTokenCount)
+		}
+	}
+	return tokens, nil
+}
+
 // GenerateCoachReport asks the model for a free-form markdown coaching
 // report aggregating the per-question evaluations. Unlike the other LLM
 // calls there is no ResponseSchema — the report is consumed as markdown

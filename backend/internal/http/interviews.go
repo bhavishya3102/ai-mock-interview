@@ -46,6 +46,7 @@ type InterviewService interface {
 	DeleteResume(ctx context.Context, clerkUserID string) error
 	GenerateCoachReport(ctx context.Context, clerkUserID, mockID string) (domain.CoachReport, error)
 	GetCoachReport(ctx context.Context, clerkUserID, mockID string) (domain.CoachReport, error)
+	StreamCoachReport(ctx context.Context, clerkUserID, mockID string, onChunk func(text string) error) (domain.CoachReport, error)
 }
 
 // InterviewHandler holds dependencies for the 5 interview endpoints.
@@ -469,6 +470,87 @@ func (h *InterviewHandler) GenerateCoachReport(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, h.log, http.StatusCreated, toCoachReportResponse(cr))
+}
+
+// streamChunkEvent is the JSON payload of an `event: chunk` SSE event.
+type streamChunkEvent struct {
+	Text string `json:"text"`
+}
+
+// streamDoneEvent is the terminal `event: done` payload sent after the
+// stream completes and the report has been persisted.
+type streamDoneEvent struct {
+	MockID     string    `json:"mockId"`
+	TokensUsed int       `json:"tokensUsed"`
+	Model      string    `json:"model"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+// streamErrorEvent is the terminal `event: error` payload sent when a
+// failure occurs after streaming has already begun. Pre-stream failures
+// use the normal JSON error envelope on a non-200 status instead.
+type streamErrorEvent struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// StreamCoachReport handles POST /api/v1/interviews/{mockId}/coach-report/stream.
+//
+// Emits Server-Sent Events:
+//   - `event: chunk`  → {"text": "..."} for each model chunk
+//   - `event: done`   → {mockId, tokensUsed, model, createdAt} once the
+//     stream completes and the report is persisted
+//   - `event: error`  → {code, message} if a failure occurs MID-stream
+//
+// Pre-stream failures (auth, validation, ownership, no answers) return a
+// normal JSON error envelope on the appropriate status. The status of an
+// SSE response is 200; mid-stream failures can only be communicated as a
+// terminal `event: error`.
+func (h *InterviewHandler) StreamCoachReport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		h.respondErr(w, r, errors.New("missing user id"), domain.ErrUnauthorized)
+		return
+	}
+
+	mockID := chi.URLParam(r, "mockId")
+
+	sse, err := newSSEWriter(w)
+	if err != nil {
+		h.respondErr(w, r, err, nil)
+		return
+	}
+
+	report, svcErr := h.svc.StreamCoachReport(r.Context(), userID, mockID, func(text string) error {
+		return sse.WriteEvent("chunk", streamChunkEvent{Text: text})
+	})
+
+	if svcErr != nil {
+		// If we haven't sent any SSE bytes yet, the failure happened during
+		// pre-stream validation — fall back to a normal JSON error so the
+		// client sees the right status code and envelope shape.
+		if !sse.HeadersSent() {
+			h.respondErr(w, r, svcErr, nil)
+			return
+		}
+		// Otherwise the stream is open: emit a terminal SSE error event.
+		mapped := mapErrToHTTP(svcErr)
+		h.log.LogAttrs(r.Context(), slog.LevelInfo, "stream coach report mid-stream error",
+			slog.String("request_id", RequestIDFromContext(r.Context())),
+			slog.String("path", r.URL.Path),
+			slog.Int("mapped_status", mapped.Status),
+			slog.String("error", svcErr.Error()),
+		)
+		_ = sse.WriteEvent("error", streamErrorEvent{Code: mapped.Code, Message: mapped.Message})
+		return
+	}
+
+	_ = sse.WriteEvent("done", streamDoneEvent{
+		MockID:     report.MockID,
+		TokensUsed: report.TokensUsed,
+		Model:      report.Model,
+		CreatedAt:  report.CreatedAt,
+	})
 }
 
 // GetCoachReport handles GET /api/v1/interviews/{mockId}/coach-report.

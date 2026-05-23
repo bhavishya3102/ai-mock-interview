@@ -117,13 +117,14 @@ func (f *fakeStore) GetCoachReportByMockID(ctx context.Context, mockID, userID s
 }
 
 type fakeLLM struct {
-	model                   string
-	generateQuestionsFunc   func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
-	evaluateAnswerFunc      func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
-	transcribeAudioFunc     func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
-	extractResumeTextFunc   func(ctx context.Context, pdf []byte, mimeType string) (string, error)
-	judgeFollowUpFunc       func(ctx context.Context, in domain.FollowUpSeed) (string, error)
-	generateCoachReportFunc func(ctx context.Context, in domain.CoachReportSeed) (string, int, error)
+	model                         string
+	generateQuestionsFunc         func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
+	evaluateAnswerFunc            func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
+	transcribeAudioFunc           func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	extractResumeTextFunc         func(ctx context.Context, pdf []byte, mimeType string) (string, error)
+	judgeFollowUpFunc             func(ctx context.Context, in domain.FollowUpSeed) (string, error)
+	generateCoachReportFunc       func(ctx context.Context, in domain.CoachReportSeed) (string, int, error)
+	generateCoachReportStreamFunc func(ctx context.Context, in domain.CoachReportSeed, onChunk func(string) error) (int, error)
 }
 
 func (f *fakeLLM) Model() string {
@@ -138,6 +139,24 @@ func (f *fakeLLM) GenerateCoachReport(ctx context.Context, in domain.CoachReport
 		return f.generateCoachReportFunc(ctx, in)
 	}
 	return "## Overall Performance\nfake report", 1234, nil
+}
+
+func (f *fakeLLM) GenerateCoachReportStream(
+	ctx context.Context,
+	in domain.CoachReportSeed,
+	onChunk func(string) error,
+) (int, error) {
+	if f.generateCoachReportStreamFunc != nil {
+		return f.generateCoachReportStreamFunc(ctx, in, onChunk)
+	}
+	// Default: emit two chunks and report fake tokens.
+	if err := onChunk("## Overall Performance\n"); err != nil {
+		return 0, err
+	}
+	if err := onChunk("fake streamed body"); err != nil {
+		return 0, err
+	}
+	return 1234, nil
 }
 
 func (f *fakeLLM) ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error) {
@@ -1006,4 +1025,186 @@ func TestGetCoachReport_HappyPath(t *testing.T) {
 	got, err := svc.GetCoachReport(context.Background(), "user_1", "mock-123")
 	require.NoError(t, err)
 	require.Equal(t, want, got)
+}
+
+// --- StreamCoachReport ---
+
+func TestStreamCoachReport_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.StreamCoachReport(context.Background(), "", "mock-123", func(string) error { return nil })
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestStreamCoachReport_RequiresMockID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.StreamCoachReport(context.Background(), "user_1", "  ", func(string) error { return nil })
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestStreamCoachReport_RequiresOnChunkCallback(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", nil)
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestStreamCoachReport_CachedHitEmitsFullContentAndSkipsLLM(t *testing.T) {
+	existing := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nfull cached body",
+		TokensUsed: 999,
+		Model:      "gemini-cached",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			return existing, nil
+		},
+	}
+	llm := &fakeLLM{
+		generateCoachReportStreamFunc: func(_ context.Context, _ domain.CoachReportSeed, _ func(string) error) (int, error) {
+			t.Fatal("LLM must NOT be called when a report already exists")
+			return 0, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	var chunks []string
+	got, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", func(s string) error {
+		chunks = append(chunks, s)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, existing, got)
+	// Cached hit is one atomic chunk containing the full content.
+	require.Equal(t, []string{existing.Content}, chunks)
+	require.Empty(t, store.insertCoachReportCalls, "no insert on cached hit")
+}
+
+func TestStreamCoachReport_RejectsWhenNoAnswers(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	_, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", func(string) error { return nil })
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestStreamCoachReport_HappyPath_StreamsAndPersists(t *testing.T) {
+	// First Get returns NotFound (no cache); second (readback) returns saved.
+	var getCalls int
+	saved := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nfreshly streamed body",
+		TokensUsed: 1500,
+		Model:      "gemini-test",
+		CreatedAt:  time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			getCalls++
+			if getCalls == 1 {
+				return domain.CoachReport{}, domain.ErrNotFound
+			}
+			return saved, nil
+		},
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 8)}, nil
+		},
+	}
+	llm := &fakeLLM{
+		model: "gemini-test",
+		generateCoachReportStreamFunc: func(_ context.Context, _ domain.CoachReportSeed, onChunk func(string) error) (int, error) {
+			// Emit three chunks; the service must buffer them all for persistence.
+			require.NoError(t, onChunk("## Overall Performance\n"))
+			require.NoError(t, onChunk("freshly "))
+			require.NoError(t, onChunk("streamed body"))
+			return 1500, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	var chunks []string
+	got, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", func(s string) error {
+		chunks = append(chunks, s)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, saved, got)
+
+	// Caller observed every chunk in order.
+	require.Equal(t, []string{"## Overall Performance\n", "freshly ", "streamed body"}, chunks)
+
+	// Server persisted the full concatenated buffer with model + tokens.
+	require.Len(t, store.insertCoachReportCalls, 1)
+	require.Equal(t, "## Overall Performance\nfreshly streamed body", store.insertCoachReportCalls[0].Content)
+	require.Equal(t, 1500, store.insertCoachReportCalls[0].TokensUsed)
+	require.Equal(t, "gemini-test", store.insertCoachReportCalls[0].Model)
+}
+
+func TestStreamCoachReport_CallbackErrorAbortsWithoutPersisting(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 8)}, nil
+		},
+	}
+	cbErr := fmt.Errorf("client disconnected")
+	llm := &fakeLLM{
+		generateCoachReportStreamFunc: func(_ context.Context, _ domain.CoachReportSeed, onChunk func(string) error) (int, error) {
+			// The first chunk's callback fails; the LLM wrapper bubbles
+			// that error up wrapped — service must NOT persist.
+			if err := onChunk("partial"); err != nil {
+				return 0, fmt.Errorf("stream: %w", err)
+			}
+			return 0, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", func(string) error {
+		return cbErr
+	})
+	require.Error(t, err)
+	require.Empty(t, store.insertCoachReportCalls, "partial report must not be persisted")
+}
+
+func TestStreamCoachReport_RaceConflictReturnsWinner(t *testing.T) {
+	var getCalls int
+	winner := domain.CoachReport{
+		MockID:    "mock-123",
+		Content:   "## Overall Performance\nwinning cached body",
+		Model:     "gemini-test",
+		CreatedAt: time.Now().UTC(),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			getCalls++
+			if getCalls == 1 {
+				return domain.CoachReport{}, domain.ErrNotFound
+			}
+			return winner, nil
+		},
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 7)}, nil
+		},
+		insertCoachReportFunc: func(_ context.Context, _ domain.CoachReport) error {
+			return fmt.Errorf("simulated race: %w", domain.ErrConflict)
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	got, err := svc.StreamCoachReport(context.Background(), "user_1", "mock-123", func(string) error { return nil })
+	require.NoError(t, err)
+	require.Equal(t, winner, got)
 }

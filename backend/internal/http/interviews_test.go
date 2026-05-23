@@ -42,6 +42,7 @@ type fakeSvc struct {
 	deleteResumeFunc        func(ctx context.Context, userID string) error
 	generateCoachReportFunc func(ctx context.Context, userID, mockID string) (domain.CoachReport, error)
 	getCoachReportFunc      func(ctx context.Context, userID, mockID string) (domain.CoachReport, error)
+	streamCoachReportFunc   func(ctx context.Context, userID, mockID string, onChunk func(string) error) (domain.CoachReport, error)
 }
 
 func (f *fakeSvc) CreateInterview(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error) {
@@ -101,6 +102,12 @@ func (f *fakeSvc) GetCoachReport(ctx context.Context, userID, mockID string) (do
 	}
 	return f.getCoachReportFunc(ctx, userID, mockID)
 }
+func (f *fakeSvc) StreamCoachReport(ctx context.Context, userID, mockID string, onChunk func(string) error) (domain.CoachReport, error) {
+	if f.streamCoachReportFunc == nil {
+		return domain.CoachReport{}, nil
+	}
+	return f.streamCoachReportFunc(ctx, userID, mockID, onChunk)
+}
 
 // withUserID returns a request whose context carries a Clerk user ID — used
 // to simulate the auth middleware having already run.
@@ -122,6 +129,7 @@ func interviewRouter(h *InterviewHandler) http.Handler {
 	r.Post("/api/v1/interviews/{mockId}/transcribe", h.Transcribe)
 	r.Post("/api/v1/interviews/{mockId}/coach-report", h.GenerateCoachReport)
 	r.Get("/api/v1/interviews/{mockId}/coach-report", h.GetCoachReport)
+	r.Post("/api/v1/interviews/{mockId}/coach-report/stream", h.StreamCoachReport)
 	r.Post("/api/v1/resume", h.UploadResume)
 	r.Get("/api/v1/resume", h.GetResume)
 	r.Delete("/api/v1/resume", h.DeleteResume)
@@ -679,4 +687,170 @@ func TestGetCoachReport_NotFound(t *testing.T) {
 
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	require.Contains(t, rec.Body.String(), "not_found")
+}
+
+// --- StreamCoachReport (POST /interviews/{mockId}/coach-report/stream) ---
+
+// sseEvent is a parsed SSE event: {event: "chunk", data: <raw json bytes>}.
+type sseEvent struct {
+	Event string
+	Data  string
+}
+
+// parseSSE splits an SSE response body into events. Empty events (just a
+// blank line) are skipped. data may contain multiple `data:` lines joined
+// with \n per the spec — for our handler each event has a single data line.
+func parseSSE(t *testing.T, body string) []sseEvent {
+	t.Helper()
+	var events []sseEvent
+	for _, block := range strings.Split(strings.TrimSpace(body), "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var ev sseEvent
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				ev.Event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				ev.Data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func TestStreamCoachReport_Unauthorized_PlainJSONNotSSE(t *testing.T) {
+	h := NewInterviewHandler(&fakeSvc{}, discardLogger())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report/stream", nil)
+	rec := httptest.NewRecorder()
+
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+	require.NotEqual(t, "text/event-stream", rec.Header().Get("Content-Type"),
+		"auth failure must not open an SSE stream")
+}
+
+func TestStreamCoachReport_PreStreamFailureReturnsPlainJSON(t *testing.T) {
+	// Service errors WITHOUT having called onChunk → handler emits a normal
+	// JSON error envelope on the mapped HTTP status (no SSE bytes yet).
+	svc := &fakeSvc{
+		streamCoachReportFunc: func(_ context.Context, _, _ string, _ func(string) error) (domain.CoachReport, error) {
+			return domain.CoachReport{}, domain.ErrValidation
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report/stream", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.NotEqual(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Contains(t, rec.Body.String(), "validation_failed")
+}
+
+func TestStreamCoachReport_HappyPath_EmitsChunksAndDoneEvent(t *testing.T) {
+	want := domain.CoachReport{
+		MockID:     "mock-abc",
+		Content:    "## Overall Performance\nfull body",
+		TokensUsed: 1500,
+		Model:      "gemini-test",
+		CreatedAt:  time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+	}
+	svc := &fakeSvc{
+		streamCoachReportFunc: func(_ context.Context, userID, mockID string, onChunk func(string) error) (domain.CoachReport, error) {
+			require.Equal(t, "user_1", userID)
+			require.Equal(t, "mock-abc", mockID)
+			require.NoError(t, onChunk("## Overall Performance\n"))
+			require.NoError(t, onChunk("full body"))
+			return want, nil
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report/stream", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+	require.Equal(t, "no", rec.Header().Get("X-Accel-Buffering"))
+
+	events := parseSSE(t, rec.Body.String())
+	require.Len(t, events, 3)
+
+	require.Equal(t, "chunk", events[0].Event)
+	require.JSONEq(t, `{"text":"## Overall Performance\n"}`, events[0].Data)
+
+	require.Equal(t, "chunk", events[1].Event)
+	require.JSONEq(t, `{"text":"full body"}`, events[1].Data)
+
+	require.Equal(t, "done", events[2].Event)
+	var done streamDoneEvent
+	require.NoError(t, json.Unmarshal([]byte(events[2].Data), &done))
+	require.Equal(t, "mock-abc", done.MockID)
+	require.Equal(t, 1500, done.TokensUsed)
+	require.Equal(t, "gemini-test", done.Model)
+}
+
+func TestStreamCoachReport_MidStreamLLMFailureEmitsErrorEvent(t *testing.T) {
+	// Stream opens (chunk emitted), then LLM fails — handler must NOT change
+	// HTTP status (already 200) and must emit a terminal SSE error event.
+	svc := &fakeSvc{
+		streamCoachReportFunc: func(_ context.Context, _, _ string, onChunk func(string) error) (domain.CoachReport, error) {
+			require.NoError(t, onChunk("## Overall Performance\n"))
+			return domain.CoachReport{}, domain.ErrLLM
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report/stream", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "headers already sent; SSE keeps 200")
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+
+	events := parseSSE(t, rec.Body.String())
+	require.Len(t, events, 2)
+	require.Equal(t, "chunk", events[0].Event)
+	require.Equal(t, "error", events[1].Event)
+
+	var errEv streamErrorEvent
+	require.NoError(t, json.Unmarshal([]byte(events[1].Data), &errEv))
+	require.Equal(t, "llm_failure", errEv.Code)
+}
+
+func TestStreamCoachReport_CachedHitProducesSingleChunkAndDone(t *testing.T) {
+	// Mirrors the service's cached-hit behavior: one chunk with full content,
+	// then done. From the wire the client cannot tell whether it was cached.
+	want := domain.CoachReport{
+		MockID:    "mock-abc",
+		Content:   "## Overall Performance\ncached full body",
+		Model:     "gemini-cached",
+		CreatedAt: time.Now().UTC(),
+	}
+	svc := &fakeSvc{
+		streamCoachReportFunc: func(_ context.Context, _, _ string, onChunk func(string) error) (domain.CoachReport, error) {
+			require.NoError(t, onChunk(want.Content))
+			return want, nil
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report/stream", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	events := parseSSE(t, rec.Body.String())
+	require.Len(t, events, 2)
+	require.Equal(t, "chunk", events[0].Event)
+	require.JSONEq(t, `{"text":"## Overall Performance\ncached full body"}`, events[0].Data)
+	require.Equal(t, "done", events[1].Event)
 }

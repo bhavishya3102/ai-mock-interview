@@ -185,14 +185,111 @@ r.Route("/{mockId}/coach-report", func(r chi.Router) {
 Coverage targets stay at ≥80% on `service/` + `store/`. The LLM client
 itself is not directly tested (covered through service mocks).
 
-## 9. Out of scope (deferred)
+## 9. Phase 2 — SSE streaming
 
-- **Streaming** (SSE): Phase 2. Will add a sibling endpoint
-  `/coach-report/stream` that reuses the same prompt + persistence but
-  streams chunks. Persistence still happens once at stream completion.
+Adds a sibling endpoint that streams the same coach report token-by-token
+so the user sees output appear in real time instead of waiting 10–15
+seconds for the full POST to return. Persistence model is unchanged: the
+backend buffers chunks as they arrive and inserts the full content once
+the stream completes.
+
+### Endpoint
+
+`POST /api/v1/interviews/{mockId}/coach-report/stream`
+
+- No request body.
+- Response is `text/event-stream` (SSE). Long-lived connection until the
+  model finishes or the client disconnects.
+- Auth (Clerk JWT) is enforced before the upgrade — failures return a
+  plain JSON error envelope, not an SSE stream.
+
+### Wire format
+
+Each event is `event: <type>\ndata: <json>\n\n`. JSON-wrapped data sidesteps
+newline-escaping ambiguity in raw SSE `data:` lines.
+
+```
+event: chunk
+data: {"text":"## Overall"}
+
+event: chunk
+data: {"text":" Performance\n\nYou demonstrated"}
+
+event: done
+data: {"mockId":"abc","tokensUsed":1842,"model":"gemini-2.5-flash","createdAt":"2026-05-23T10:00:00Z"}
+```
+
+A terminal `event: error` with `{"code":"...","message":"..."}` is sent if
+the LLM fails mid-stream. The client treats either `done` or `error` as the
+stream terminator.
+
+### Cached-hit behavior
+
+If a report already exists for `mockID`, the service emits the full cached
+content as a **single chunk event** followed by `done` — no LLM call, no
+billing. From the client's perspective the contract is identical; only the
+perceived speed differs (instant vs. ~15s typewriter).
+
+### Service signature (callback inversion)
+
+Streaming is exposed as a single method that takes a callback rather than
+returning a channel + finalizer. This keeps the lifecycle linear (no
+goroutine bookkeeping in callers), and the HTTP layer's per-chunk error
+(write failure / client disconnect) is surfaced naturally by the callback
+return value.
+
+```go
+// service/interview.go
+func (s *InterviewService) StreamCoachReport(
+    ctx context.Context,
+    clerkUserID, mockID string,
+    onChunk func(text string) error,
+) (domain.CoachReport, error)
+
+// llm/gemini.go
+func (c *Client) GenerateCoachReportStream(
+    ctx context.Context,
+    in domain.CoachReportSeed,
+    onChunk func(text string) error,
+) (tokensUsed int, err error)
+```
+
+### Lifecycle
+
+1. Validate identity, mockID, ownership, answers — same order as the
+   non-streaming flow.
+2. **Cached?** Call `onChunk(existing.Content)` once, return the existing row.
+3. Open Gemini stream via `Models.GenerateContentStream` (Go 1.23+ `iter.Seq2`).
+4. For each chunk: append to a server-side buffer, call `onChunk` — if the
+   callback errors (client disconnect, write failure), cancel the inner
+   ctx and abort. No partial persistence.
+5. After clean completion: `InsertCoachReport(...)`. Conflict (race) →
+   swallow and `GetCoachReportByMockID` for the winner.
+6. Return the persisted (or winning) report so the handler can emit the
+   `done` event with `mockId`, `tokensUsed`, `model`, `createdAt`.
+
+### Persistence rule
+
+Partial reports are useless to the candidate, so a client disconnect (or
+any mid-stream failure) does NOT persist. The next stream attempt starts
+fresh from the LLM. The single UNIQUE constraint on `mock_id` still gates
+duplicate inserts when two clients race a fresh generation.
+
+### Testing additions
+
+| Layer | New cases |
+|---|---|
+| `service/interview_test.go` | cached hit emits full content via callback and skips LLM; fresh stream invokes callback for each chunk + persists buffered total; callback error aborts cleanly; race on insert returns winner |
+| `http/sse_test.go` | sseWriter emits well-formed events; flushes after each |
+| `http/interviews_test.go` | streaming endpoint: SSE headers, chunk + done events, terminal error event on service ErrLLM, 401 plain-JSON when no auth |
+
+## 10. Out of scope (deferred)
+
 - **Regenerate**: no UI yet for "throw away and regenerate". When needed,
   add `DELETE /coach-report` rather than mutating in place.
 - **Multi-language**: report is English-only for now. Locale negotiation
   is a future concern.
 - **Token-cost UI**: `tokens_used` is captured but not surfaced to the
   user yet — analytics-only.
+- **Frontend SSE consumer**: tracked as a separate Phase 3 task; backend
+  contract above is the integration point.
