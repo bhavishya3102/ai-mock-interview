@@ -30,16 +30,18 @@ func discardLogger() *slog.Logger {
 // fakeSvc implements InterviewService for handler tests. Per-test override
 // via *Func fields.
 type fakeSvc struct {
-	createInterviewFunc func(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error)
-	listInterviewsFunc  func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
-	getInterviewFunc    func(ctx context.Context, userID, mockID string) (domain.MockInterview, error)
-	submitAnswerFunc    func(ctx context.Context, userID string, in service.SubmitAnswerInput) (domain.UserAnswer, error)
-	listFeedbackFunc    func(ctx context.Context, userID, mockID string) ([]domain.UserAnswer, error)
-	transcribeAudioFunc func(ctx context.Context, userID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
-	judgeFollowUpFunc   func(ctx context.Context, userID string, in service.JudgeFollowUpInput) (string, error)
-	uploadResumeFunc    func(ctx context.Context, userID string, pdf []byte, mimeType string) (domain.ResumeStatus, error)
-	getResumeFunc       func(ctx context.Context, userID string) (domain.ResumeStatus, error)
-	deleteResumeFunc    func(ctx context.Context, userID string) error
+	createInterviewFunc     func(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error)
+	listInterviewsFunc      func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
+	getInterviewFunc        func(ctx context.Context, userID, mockID string) (domain.MockInterview, error)
+	submitAnswerFunc        func(ctx context.Context, userID string, in service.SubmitAnswerInput) (domain.UserAnswer, error)
+	listFeedbackFunc        func(ctx context.Context, userID, mockID string) ([]domain.UserAnswer, error)
+	transcribeAudioFunc     func(ctx context.Context, userID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
+	judgeFollowUpFunc       func(ctx context.Context, userID string, in service.JudgeFollowUpInput) (string, error)
+	uploadResumeFunc        func(ctx context.Context, userID string, pdf []byte, mimeType string) (domain.ResumeStatus, error)
+	getResumeFunc           func(ctx context.Context, userID string) (domain.ResumeStatus, error)
+	deleteResumeFunc        func(ctx context.Context, userID string) error
+	generateCoachReportFunc func(ctx context.Context, userID, mockID string) (domain.CoachReport, error)
+	getCoachReportFunc      func(ctx context.Context, userID, mockID string) (domain.CoachReport, error)
 }
 
 func (f *fakeSvc) CreateInterview(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error) {
@@ -87,6 +89,18 @@ func (f *fakeSvc) DeleteResume(ctx context.Context, userID string) error {
 	}
 	return f.deleteResumeFunc(ctx, userID)
 }
+func (f *fakeSvc) GenerateCoachReport(ctx context.Context, userID, mockID string) (domain.CoachReport, error) {
+	if f.generateCoachReportFunc == nil {
+		return domain.CoachReport{}, nil
+	}
+	return f.generateCoachReportFunc(ctx, userID, mockID)
+}
+func (f *fakeSvc) GetCoachReport(ctx context.Context, userID, mockID string) (domain.CoachReport, error) {
+	if f.getCoachReportFunc == nil {
+		return domain.CoachReport{}, nil
+	}
+	return f.getCoachReportFunc(ctx, userID, mockID)
+}
 
 // withUserID returns a request whose context carries a Clerk user ID — used
 // to simulate the auth middleware having already run.
@@ -106,6 +120,8 @@ func interviewRouter(h *InterviewHandler) http.Handler {
 	r.Post("/api/v1/interviews/{mockId}/answers", h.SubmitAnswer)
 	r.Get("/api/v1/interviews/{mockId}/feedback", h.ListFeedback)
 	r.Post("/api/v1/interviews/{mockId}/transcribe", h.Transcribe)
+	r.Post("/api/v1/interviews/{mockId}/coach-report", h.GenerateCoachReport)
+	r.Get("/api/v1/interviews/{mockId}/coach-report", h.GetCoachReport)
 	r.Post("/api/v1/resume", h.UploadResume)
 	r.Get("/api/v1/resume", h.GetResume)
 	r.Delete("/api/v1/resume", h.DeleteResume)
@@ -536,4 +552,131 @@ func TestMapErrToHTTP(t *testing.T) {
 			require.Equal(t, tt.wantCode, got.Code)
 		})
 	}
+}
+
+// --- GenerateCoachReport (POST /interviews/{mockId}/coach-report) ---
+
+func sampleCoachReport() domain.CoachReport {
+	return domain.CoachReport{
+		MockID:     "mock-abc",
+		Content:    "## Overall Performance\nyou did well on the React questions",
+		TokensUsed: 1500,
+		Model:      "gemini-test",
+		CreatedAt:  time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestGenerateCoachReport_Unauthorized(t *testing.T) {
+	h := NewInterviewHandler(&fakeSvc{}, discardLogger())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report", nil)
+	rec := httptest.NewRecorder()
+
+	interviewRouter(h).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestGenerateCoachReport_HappyPath_Returns201WithBody(t *testing.T) {
+	want := sampleCoachReport()
+	svc := &fakeSvc{
+		generateCoachReportFunc: func(_ context.Context, userID, mockID string) (domain.CoachReport, error) {
+			require.Equal(t, "user_1", userID)
+			require.Equal(t, "mock-abc", mockID)
+			return want, nil
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	var got coachReportResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "mock-abc", got.MockID)
+	require.Equal(t, want.Content, got.Content)
+	require.Equal(t, want.TokensUsed, got.TokensUsed)
+	require.Equal(t, want.Model, got.Model)
+}
+
+func TestGenerateCoachReport_ErrorMapping(t *testing.T) {
+	tests := []struct {
+		name       string
+		svcErr     error
+		wantStatus int
+		wantCode   string
+	}{
+		{"validation (no answers)", domain.ErrValidation, http.StatusBadRequest, "validation_failed"},
+		{"not found / not owned", domain.ErrNotFound, http.StatusNotFound, "not_found"},
+		{"llm upstream", domain.ErrLLM, http.StatusBadGateway, "llm_failure"},
+		{"internal", errors.New("boom"), http.StatusInternalServerError, "internal_error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &fakeSvc{
+				generateCoachReportFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+					return domain.CoachReport{}, tt.svcErr
+				},
+			}
+			h := NewInterviewHandler(svc, discardLogger())
+
+			req := withUserID(httptest.NewRequest(http.MethodPost, "/api/v1/interviews/mock-abc/coach-report", nil), "user_1")
+			rec := httptest.NewRecorder()
+			interviewRouter(h).ServeHTTP(rec, req)
+
+			require.Equal(t, tt.wantStatus, rec.Code)
+			require.Contains(t, rec.Body.String(), tt.wantCode)
+		})
+	}
+}
+
+// --- GetCoachReport (GET /interviews/{mockId}/coach-report) ---
+
+func TestGetCoachReport_Unauthorized(t *testing.T) {
+	h := NewInterviewHandler(&fakeSvc{}, discardLogger())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/interviews/mock-abc/coach-report", nil)
+	rec := httptest.NewRecorder()
+
+	interviewRouter(h).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestGetCoachReport_HappyPath_Returns200WithBody(t *testing.T) {
+	want := sampleCoachReport()
+	svc := &fakeSvc{
+		getCoachReportFunc: func(_ context.Context, userID, mockID string) (domain.CoachReport, error) {
+			require.Equal(t, "user_1", userID)
+			require.Equal(t, "mock-abc", mockID)
+			return want, nil
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/api/v1/interviews/mock-abc/coach-report", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got coachReportResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, want.MockID, got.MockID)
+	require.Equal(t, want.Content, got.Content)
+}
+
+func TestGetCoachReport_NotFound(t *testing.T) {
+	svc := &fakeSvc{
+		getCoachReportFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			return domain.CoachReport{}, domain.ErrNotFound
+		},
+	}
+	h := NewInterviewHandler(svc, discardLogger())
+
+	req := withUserID(httptest.NewRequest(http.MethodGet, "/api/v1/interviews/mock-abc/coach-report", nil), "user_1")
+	rec := httptest.NewRecorder()
+	interviewRouter(h).ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "not_found")
 }

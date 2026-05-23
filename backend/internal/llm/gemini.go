@@ -37,6 +37,11 @@ func NewClient(ctx context.Context, apiKey, model string) (*Client, error) {
 	return &Client{sdk: sdk, model: model}, nil
 }
 
+// Model returns the configured Gemini model identifier (e.g. "gemini-2.5-flash").
+// Stored alongside generated content so reports remain traceable to the
+// model version that produced them.
+func (c *Client) Model() string { return c.model }
+
 // GenerateQuestions asks the model for QuestionCount question/answer pairs.
 // The response is structured JSON validated by questionGenSchema, so we can
 // json.Unmarshal directly without string-mutation hacks.
@@ -233,6 +238,42 @@ func (c *Client) JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (str
 		return "", fmt.Errorf("gemini decode follow-up: %w", errors.Join(domain.ErrLLM, err))
 	}
 	return out.FollowUp, nil
+}
+
+// GenerateCoachReport asks the model for a free-form markdown coaching
+// report aggregating the per-question evaluations. Unlike the other LLM
+// calls there is no ResponseSchema — the report is consumed as markdown
+// by the frontend renderer.
+//
+// Returns the markdown content, the total tokens used (prompt + completion;
+// 0 if the SDK omitted UsageMetadata), and a wrapped error tagged with
+// ErrLLM on any failure.
+func (c *Client) GenerateCoachReport(ctx context.Context, in domain.CoachReportSeed) (string, int, error) {
+	cfg := &genai.GenerateContentConfig{
+		Temperature: genai.Ptr[float32](0.7),
+		TopP:        genai.Ptr[float32](0.95),
+	}
+
+	resp, err := c.sdk.Models.GenerateContent(
+		ctx,
+		c.model,
+		genai.Text(buildCoachReportPrompt(in)),
+		cfg,
+	)
+	if err != nil {
+		return "", 0, fmt.Errorf("gemini generate coach report: %w", errors.Join(domain.ErrLLM, err))
+	}
+
+	content := resp.Text()
+	if content == "" {
+		return "", 0, fmt.Errorf("gemini empty coach report: %w", domain.ErrLLM)
+	}
+
+	tokens := 0
+	if resp.UsageMetadata != nil {
+		tokens = int(resp.UsageMetadata.TotalTokenCount)
+	}
+	return content, tokens, nil
 }
 
 // EvaluateAnswer asks the model to rate the candidate's answer 1..10 with

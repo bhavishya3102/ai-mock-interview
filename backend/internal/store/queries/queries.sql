@@ -65,3 +65,13 @@ SELECT mock_id, clerk_user_id, question_index, question_text,
 FROM user_answers
 WHERE mock_id = $1 AND clerk_user_id = $2
 ORDER BY question_index ASC;
+
+-- name: InsertCoachReport :exec
+INSERT INTO coach_reports (mock_id, content, tokens_used, model)
+VALUES ($1, $2, $3, $4);
+
+-- name: GetCoachReportByMockID :one
+SELECT cr.mock_id, cr.content, cr.tokens_used, cr.model, cr.created_at
+FROM coach_reports cr
+JOIN mock_interviews mi ON mi.mock_id = cr.mock_id
+WHERE cr.mock_id = $1 AND mi.clerk_user_id = $2;

@@ -88,6 +88,56 @@ Constraints:
 	)
 }
 
+func buildCoachReportPrompt(in domain.CoachReportSeed) string {
+	var answers strings.Builder
+	for _, a := range in.Answers {
+		fmt.Fprintf(&answers,
+			"Q%d: %s\nCandidate's answer: %s\nPer-question rating: %d/10\nPer-question feedback: %s\nSpeech metrics: %d fillers, %d words/min, %d long pauses\n\n",
+			a.QuestionIndex+1,
+			a.QuestionText,
+			a.UserAnswer,
+			a.Rating,
+			a.Feedback,
+			a.FillerCount,
+			a.WordsPerMinute,
+			a.LongPauseCount,
+		)
+	}
+
+	return fmt.Sprintf(`You are an experienced interview coach writing a personalised post-interview review for a candidate. You are NOT re-grading the answers — the per-question ratings and feedback are already final and given to you as evidence. Your job is to synthesise them into a single narrative report the candidate can act on.
+
+Candidate context:
+- Role applied for: %s
+- Years of experience: %d
+
+Per-question evidence (already evaluated):
+%s
+Write the report in markdown using EXACTLY these section headings, in this order:
+
+## Overall Performance
+One short paragraph naming the candidate's overall level for this role and the 1–2 most important takeaways.
+
+### Strengths
+Bulleted list (2–5 items). Cite specific evidence from the answers above (quote or paraphrase a phrase, name the topic). Generic praise is not allowed.
+
+### Areas to Improve
+Bulleted list (2–5 items). Cite specific evidence. For each item, say what was missing or wrong and what "good" would look like.
+
+### Recommended Next Steps
+Numbered list (3 items). Each item is one concrete action the candidate can take this week — a topic to study, a pattern to practice, a resource type to read (no specific URLs). Tie each step to a weakness named above.
+
+### Speaking & Delivery
+One short paragraph. Use the speech metrics (fillers, words/minute, long pauses) to comment on pace and confidence. If metrics are all zero, say "no audio metrics captured for this interview" and skip pace commentary.
+
+Tone: direct, supportive, second person ("you"). No preamble before the first heading, no closing pep talk, no emojis.
+
+Output the markdown only — no JSON, no code fences around the whole report.`,
+		in.JobPosition,
+		in.YearsExperience,
+		answers.String(),
+	)
+}
+
 func buildAnswerEvalPrompt(in domain.AnswerSeed) string {
 	return fmt.Sprintf(`You are evaluating a candidate's answer in a technical interview for the role of %s.
 

@@ -56,6 +56,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 			r.Post("/{mockId}/transcribe", ih.Transcribe)
 			r.Post("/{mockId}/follow-up", ih.JudgeFollowUp)
 			r.Get("/{mockId}/feedback", ih.ListFeedback)
+			r.Post("/{mockId}/coach-report", ih.GenerateCoachReport)
+			r.Get("/{mockId}/coach-report", ih.GetCoachReport)
 		})
 		r.Route("/resume", func(r chi.Router) {
 			r.Post("/", ih.UploadResume)

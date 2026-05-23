@@ -57,10 +57,12 @@ func run() error {
 
 	interviewRepo := store.NewInterviewRepo(pool)
 	answerRepo := store.NewAnswerRepo(pool)
+	coachReportRepo := store.NewCoachReportRepo(pool)
 
 	storeFacade := combinedStore{
-		InterviewRepo: interviewRepo,
-		AnswerRepo:    answerRepo,
+		InterviewRepo:   interviewRepo,
+		AnswerRepo:      answerRepo,
+		CoachReportRepo: coachReportRepo,
 	}
 
 	svc := service.NewInterviewService(storeFacade, llmClient)
@@ -116,10 +118,11 @@ func run() error {
 	return nil
 }
 
-// combinedStore implements service.Store by composing the two repos. Service
-// only sees a single dependency; the split between interview and answer
-// repos stays a store-package concern.
+// combinedStore implements service.Store by composing the repos. Service
+// only sees a single dependency; the split between interview, answer, and
+// coach-report repos stays a store-package concern.
 type combinedStore struct {
 	*store.InterviewRepo
 	*store.AnswerRepo
+	*store.CoachReportRepo
 }

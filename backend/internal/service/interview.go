@@ -27,6 +27,8 @@ type Store interface {
 	GetInterviewByMockID(ctx context.Context, mockID, clerkUserID string) (domain.MockInterview, error)
 	UpsertAnswer(ctx context.Context, a domain.UserAnswer) error
 	ListAnswersByMockID(ctx context.Context, mockID, clerkUserID string) ([]domain.UserAnswer, error)
+	InsertCoachReport(ctx context.Context, cr domain.CoachReport) error
+	GetCoachReportByMockID(ctx context.Context, mockID, clerkUserID string) (domain.CoachReport, error)
 }
 
 // LLMClient is the LLM interface required by InterviewService.
@@ -36,6 +38,8 @@ type LLMClient interface {
 	TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
 	ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error)
 	JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error)
+	GenerateCoachReport(ctx context.Context, in domain.CoachReportSeed) (content string, tokensUsed int, err error)
+	Model() string
 }
 
 // maxResumeTextLen caps the stored extracted resume text. A real resume is
@@ -427,6 +431,114 @@ func (s *InterviewService) TranscribeAudio(
 	}
 	result.Analysis.LongPauseCount = longPauseCount
 	return result, nil
+}
+
+// GenerateCoachReport produces (or returns the cached) narrative coaching
+// report for a finished interview. The operation is idempotent: if a report
+// already exists for mockID we return it without re-calling the LLM, so a
+// second POST is free and safe.
+//
+// Order: identity -> mockID validation -> upsert user -> idempotency check
+// -> ownership via parent interview -> pre-condition (answers exist) -> LLM
+// -> persist -> readback. A unique-violation on insert (two concurrent
+// POSTs) is swallowed and the winning row is returned.
+func (s *InterviewService) GenerateCoachReport(
+	ctx context.Context,
+	clerkUserID string,
+	mockID string,
+) (domain.CoachReport, error) {
+	if clerkUserID == "" {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", domain.ErrUnauthorized)
+	}
+	if strings.TrimSpace(mockID) == "" {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", domain.ErrValidation)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+
+	// Idempotency: if a report already exists for this user+mock, return it.
+	// This is both a cost-saver and the natural deduplication path on POST.
+	existing, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+
+	// Ownership check via parent interview row. Returns ErrNotFound if the
+	// interview doesn't exist OR the user doesn't own it — never leaks.
+	mi, err := s.store.GetInterviewByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+
+	answers, err := s.store.ListAnswersByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+	if len(answers) == 0 {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: no answers submitted: %w", domain.ErrValidation)
+	}
+
+	content, tokens, err := s.llm.GenerateCoachReport(ctx, domain.CoachReportSeed{
+		JobPosition:     mi.JobPosition,
+		YearsExperience: mi.YearsExperience,
+		Answers:         answers,
+	})
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+
+	cr := domain.CoachReport{
+		MockID:     mockID,
+		Content:    content,
+		TokensUsed: tokens,
+		Model:      s.llm.Model(),
+	}
+	if err := s.store.InsertCoachReport(ctx, cr); err != nil {
+		// Race: a parallel POST won the insert. Re-fetch and return the
+		// winning row so the caller still sees a coherent report.
+		if errors.Is(err, domain.ErrConflict) {
+			winner, fetchErr := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+			if fetchErr != nil {
+				return domain.CoachReport{}, fmt.Errorf("generate coach report after race: %w", fetchErr)
+			}
+			return winner, nil
+		}
+		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
+	}
+
+	// Re-read for the DB-assigned created_at.
+	saved, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("generate coach report readback: %w", err)
+	}
+	return saved, nil
+}
+
+// GetCoachReport fetches an existing report. Returns ErrNotFound if the
+// user has not generated one yet (or doesn't own the interview).
+func (s *InterviewService) GetCoachReport(
+	ctx context.Context,
+	clerkUserID string,
+	mockID string,
+) (domain.CoachReport, error) {
+	if clerkUserID == "" {
+		return domain.CoachReport{}, fmt.Errorf("get coach report: %w", domain.ErrUnauthorized)
+	}
+	if strings.TrimSpace(mockID) == "" {
+		return domain.CoachReport{}, fmt.Errorf("get coach report: %w", domain.ErrValidation)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return domain.CoachReport{}, fmt.Errorf("get coach report: %w", err)
+	}
+	cr, err := s.store.GetCoachReportByMockID(ctx, mockID, clerkUserID)
+	if err != nil {
+		return domain.CoachReport{}, fmt.Errorf("get coach report: %w", err)
+	}
+	return cr, nil
 }
 
 // ListFeedback returns all answers for an interview the user owns.

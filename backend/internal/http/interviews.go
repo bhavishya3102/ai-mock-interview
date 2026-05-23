@@ -44,6 +44,8 @@ type InterviewService interface {
 	UploadResume(ctx context.Context, clerkUserID string, pdf []byte, mimeType string) (domain.ResumeStatus, error)
 	GetResume(ctx context.Context, clerkUserID string) (domain.ResumeStatus, error)
 	DeleteResume(ctx context.Context, clerkUserID string) error
+	GenerateCoachReport(ctx context.Context, clerkUserID, mockID string) (domain.CoachReport, error)
+	GetCoachReport(ctx context.Context, clerkUserID, mockID string) (domain.CoachReport, error)
 }
 
 // InterviewHandler holds dependencies for the 5 interview endpoints.
@@ -424,6 +426,69 @@ func (h *InterviewHandler) ListFeedback(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, h.log, http.StatusOK, map[string]any{
 		"items": items,
 	})
+}
+
+// coachReportResponse is the JSON shape returned by the coach-report
+// endpoints. MockID is added to the wire payload so a client that re-fetches
+// can confirm the report belongs to the interview they expect — the domain
+// type hides it with `json:"-"` to keep persistence and transport decoupled.
+type coachReportResponse struct {
+	MockID     string    `json:"mockId"`
+	Content    string    `json:"content"`
+	TokensUsed int       `json:"tokensUsed"`
+	Model      string    `json:"model"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+func toCoachReportResponse(cr domain.CoachReport) coachReportResponse {
+	return coachReportResponse{
+		MockID:     cr.MockID,
+		Content:    cr.Content,
+		TokensUsed: cr.TokensUsed,
+		Model:      cr.Model,
+		CreatedAt:  cr.CreatedAt,
+	}
+}
+
+// GenerateCoachReport handles POST /api/v1/interviews/{mockId}/coach-report.
+//
+// Always returns 201 (Created) on success, whether a fresh report was
+// generated or an existing one was returned (idempotency is a service
+// concern, transparent to the caller).
+func (h *InterviewHandler) GenerateCoachReport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		h.respondErr(w, r, errors.New("missing user id"), domain.ErrUnauthorized)
+		return
+	}
+
+	mockID := chi.URLParam(r, "mockId")
+	cr, err := h.svc.GenerateCoachReport(r.Context(), userID, mockID)
+	if err != nil {
+		h.respondErr(w, r, err, nil)
+		return
+	}
+	writeJSON(w, h.log, http.StatusCreated, toCoachReportResponse(cr))
+}
+
+// GetCoachReport handles GET /api/v1/interviews/{mockId}/coach-report.
+//
+// Returns 404 when no report has been generated yet — the client decides
+// whether to show "generate" UI or follow up with a POST.
+func (h *InterviewHandler) GetCoachReport(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		h.respondErr(w, r, errors.New("missing user id"), domain.ErrUnauthorized)
+		return
+	}
+
+	mockID := chi.URLParam(r, "mockId")
+	cr, err := h.svc.GetCoachReport(r.Context(), userID, mockID)
+	if err != nil {
+		h.respondErr(w, r, err, nil)
+		return
+	}
+	writeJSON(w, h.log, http.StatusOK, toCoachReportResponse(cr))
 }
 
 // respondErr is the single place that maps error -> HTTP and emits the slog

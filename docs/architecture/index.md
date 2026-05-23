@@ -12,6 +12,7 @@ evolve, but design decisions are captured here.
 | [`backend.md`](./backend.md) | Go API: chi router, sqlc + pgx, Clerk JWT middleware, Gemini 2.5 Flash structured output, Postgres schema, REST contract, error handling, testing strategy. |
 | [`frontend.md`](./frontend.md) | React + Vite SPA: routing map, component breakdown, TanStack Query, Clerk SPA integration, speech/webcam hooks, Tailwind + shadcn/ui, Vitest setup. |
 | [`integration.md`](./integration.md) | Monorepo glue: directory layout, env-var matrix, Neon Postgres setup, golang-migrate workflow, root Makefile, CORS policy, README structure, deployment pointers. |
+| [`coach-report.md`](./coach-report.md) | Post-interview narrative coaching report: new `coach_reports` table, idempotent generation, markdown LLM contract, POST/GET endpoints. Phase 1 = non-streaming; SSE streaming deferred to Phase 2. |
 
 ## Conventions
 

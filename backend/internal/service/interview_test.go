@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,20 +15,23 @@ import (
 // fakeStore captures call args + lets each method's behaviour be overridden
 // per test via *Func fields. Empty defaults are happy path.
 type fakeStore struct {
-	upsertCalls          []string
-	createInterviewCalls []domain.MockInterview
-	upsertAnswerCalls    []domain.UserAnswer
-	setResumeCalls       []string
+	upsertCalls           []string
+	createInterviewCalls  []domain.MockInterview
+	upsertAnswerCalls     []domain.UserAnswer
+	setResumeCalls        []string
+	insertCoachReportCalls []domain.CoachReport
 
-	upsertUserFunc           func(ctx context.Context, userID string) error
-	setUserResumeFunc        func(ctx context.Context, userID, resumeText string) error
-	getUserResumeFunc        func(ctx context.Context, userID string) (string, time.Time, error)
-	clearUserResumeFunc      func(ctx context.Context, userID string) error
-	createInterviewFunc      func(ctx context.Context, m domain.MockInterview) error
-	listInterviewsByUserFunc func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
-	getInterviewByMockIDFunc func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
-	upsertAnswerFunc         func(ctx context.Context, a domain.UserAnswer) error
-	listAnswersByMockIDFunc  func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
+	upsertUserFunc             func(ctx context.Context, userID string) error
+	setUserResumeFunc          func(ctx context.Context, userID, resumeText string) error
+	getUserResumeFunc          func(ctx context.Context, userID string) (string, time.Time, error)
+	clearUserResumeFunc        func(ctx context.Context, userID string) error
+	createInterviewFunc        func(ctx context.Context, m domain.MockInterview) error
+	listInterviewsByUserFunc   func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
+	getInterviewByMockIDFunc   func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
+	upsertAnswerFunc           func(ctx context.Context, a domain.UserAnswer) error
+	listAnswersByMockIDFunc    func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
+	insertCoachReportFunc      func(ctx context.Context, cr domain.CoachReport) error
+	getCoachReportByMockIDFunc func(ctx context.Context, mockID, userID string) (domain.CoachReport, error)
 }
 
 func (f *fakeStore) SetUserResume(ctx context.Context, userID, resumeText string) error {
@@ -97,12 +101,43 @@ func (f *fakeStore) ListAnswersByMockID(ctx context.Context, mockID, userID stri
 	return []domain.UserAnswer{}, nil
 }
 
+func (f *fakeStore) InsertCoachReport(ctx context.Context, cr domain.CoachReport) error {
+	f.insertCoachReportCalls = append(f.insertCoachReportCalls, cr)
+	if f.insertCoachReportFunc != nil {
+		return f.insertCoachReportFunc(ctx, cr)
+	}
+	return nil
+}
+
+func (f *fakeStore) GetCoachReportByMockID(ctx context.Context, mockID, userID string) (domain.CoachReport, error) {
+	if f.getCoachReportByMockIDFunc != nil {
+		return f.getCoachReportByMockIDFunc(ctx, mockID, userID)
+	}
+	return domain.CoachReport{}, domain.ErrNotFound
+}
+
 type fakeLLM struct {
-	generateQuestionsFunc func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
-	evaluateAnswerFunc    func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
-	transcribeAudioFunc   func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
-	extractResumeTextFunc func(ctx context.Context, pdf []byte, mimeType string) (string, error)
-	judgeFollowUpFunc     func(ctx context.Context, in domain.FollowUpSeed) (string, error)
+	model                   string
+	generateQuestionsFunc   func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
+	evaluateAnswerFunc      func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
+	transcribeAudioFunc     func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	extractResumeTextFunc   func(ctx context.Context, pdf []byte, mimeType string) (string, error)
+	judgeFollowUpFunc       func(ctx context.Context, in domain.FollowUpSeed) (string, error)
+	generateCoachReportFunc func(ctx context.Context, in domain.CoachReportSeed) (string, int, error)
+}
+
+func (f *fakeLLM) Model() string {
+	if f.model == "" {
+		return "gemini-test"
+	}
+	return f.model
+}
+
+func (f *fakeLLM) GenerateCoachReport(ctx context.Context, in domain.CoachReportSeed) (string, int, error) {
+	if f.generateCoachReportFunc != nil {
+		return f.generateCoachReportFunc(ctx, in)
+	}
+	return "## Overall Performance\nfake report", 1234, nil
 }
 
 func (f *fakeLLM) ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error) {
@@ -726,4 +761,249 @@ func TestCreateInterview_PassesResumeToLLM(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "Jane led a Postgres migration at Acme", seenSeed.ResumeText,
 		"stored resume text must flow into the question-generation seed")
+}
+
+// --- GenerateCoachReport ---
+
+func sampleAnswer(mockID string, idx int, rating int) domain.UserAnswer {
+	return domain.UserAnswer{
+		MockID:        mockID,
+		ClerkUserID:   "user_1",
+		QuestionIndex: idx,
+		QuestionText:  "Explain topic " + string(rune('A'+idx)),
+		CorrectAnswer: "Reference answer body",
+		UserAnswer:    "Candidate's actual answer",
+		Rating:        rating,
+		Feedback:      "Some specific feedback about this answer that is reasonably long.",
+		CreatedAt:     time.Now().UTC(),
+	}
+}
+
+func TestGenerateCoachReport_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GenerateCoachReport(context.Background(), "", "mock-123")
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestGenerateCoachReport_RequiresMockID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GenerateCoachReport(context.Background(), "user_1", "   ")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestGenerateCoachReport_IdempotentWhenExisting(t *testing.T) {
+	existing := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nalready generated",
+		TokensUsed: 999,
+		Model:      "gemini-cached",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, mockID, userID string) (domain.CoachReport, error) {
+			require.Equal(t, "mock-123", mockID)
+			require.Equal(t, "user_1", userID)
+			return existing, nil
+		},
+	}
+	llm := &fakeLLM{
+		generateCoachReportFunc: func(_ context.Context, _ domain.CoachReportSeed) (string, int, error) {
+			t.Fatal("LLM must NOT be called when a report already exists")
+			return "", 0, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	got, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Equal(t, existing, got)
+	require.Empty(t, store.insertCoachReportCalls, "no insert when report already exists")
+}
+
+func TestGenerateCoachReport_NotOwnedInterviewReturnsNotFound(t *testing.T) {
+	store := &fakeStore{
+		// No existing coach report → falls through to ownership check.
+		getInterviewByMockIDFunc: func(_ context.Context, _, _ string) (domain.MockInterview, error) {
+			return domain.MockInterview{}, domain.ErrNotFound
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	_, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestGenerateCoachReport_RejectsWhenNoAnswers(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		// listAnswersByMockIDFunc unset → default empty slice
+	}
+	llm := &fakeLLM{
+		generateCoachReportFunc: func(_ context.Context, _ domain.CoachReportSeed) (string, int, error) {
+			t.Fatal("LLM must NOT be called when no answers exist")
+			return "", 0, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestGenerateCoachReport_LLMFailurePropagatesAsErrLLM(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 7)}, nil
+		},
+	}
+	llm := &fakeLLM{
+		generateCoachReportFunc: func(_ context.Context, _ domain.CoachReportSeed) (string, int, error) {
+			return "", 0, fmt.Errorf("upstream blew up: %w", domain.ErrLLM)
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.ErrorIs(t, err, domain.ErrLLM)
+}
+
+func TestGenerateCoachReport_HappyPath_PersistsAndReturnsReadback(t *testing.T) {
+	// First GetCoachReportByMockID call returns NotFound (no cache), second
+	// (post-insert readback) returns the saved row.
+	var getCalls int
+	saved := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nyou did well",
+		TokensUsed: 1500,
+		Model:      "gemini-test",
+		CreatedAt:  time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			getCalls++
+			if getCalls == 1 {
+				return domain.CoachReport{}, domain.ErrNotFound
+			}
+			return saved, nil
+		},
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{
+				sampleAnswer(mockID, 0, 8),
+				sampleAnswer(mockID, 1, 5),
+			}, nil
+		},
+	}
+	var seenSeed domain.CoachReportSeed
+	llm := &fakeLLM{
+		model: "gemini-test",
+		generateCoachReportFunc: func(_ context.Context, in domain.CoachReportSeed) (string, int, error) {
+			seenSeed = in
+			return "## Overall Performance\nyou did well", 1500, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	got, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Equal(t, saved, got)
+
+	// LLM seed assembly: role + experience + both answers reached the LLM.
+	require.Equal(t, "Backend Engineer", seenSeed.JobPosition)
+	require.Equal(t, 5, seenSeed.YearsExperience)
+	require.Len(t, seenSeed.Answers, 2)
+
+	// Persistence: exactly one insert with the LLM output + model attribution.
+	require.Len(t, store.insertCoachReportCalls, 1)
+	require.Equal(t, "mock-123", store.insertCoachReportCalls[0].MockID)
+	require.Equal(t, 1500, store.insertCoachReportCalls[0].TokensUsed)
+	require.Equal(t, "gemini-test", store.insertCoachReportCalls[0].Model)
+	require.Contains(t, store.insertCoachReportCalls[0].Content, "## Overall Performance")
+}
+
+func TestGenerateCoachReport_RaceConflictReturnsWinner(t *testing.T) {
+	// Simulate two concurrent POSTs: the cache miss happens first, the
+	// other request wins the insert, and our insert returns ErrConflict.
+	// The service must swallow the conflict and re-read the winner.
+	var getCalls int
+	winner := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nwinning content",
+		TokensUsed: 2000,
+		Model:      "gemini-test",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, _, _ string) (domain.CoachReport, error) {
+			getCalls++
+			if getCalls == 1 {
+				return domain.CoachReport{}, domain.ErrNotFound
+			}
+			return winner, nil
+		},
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, _ string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 7)}, nil
+		},
+		insertCoachReportFunc: func(_ context.Context, _ domain.CoachReport) error {
+			return fmt.Errorf("simulated race: %w", domain.ErrConflict)
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	got, err := svc.GenerateCoachReport(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Equal(t, winner, got)
+}
+
+// --- GetCoachReport ---
+
+func TestGetCoachReport_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GetCoachReport(context.Background(), "", "mock-123")
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestGetCoachReport_RequiresMockID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GetCoachReport(context.Background(), "user_1", "")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestGetCoachReport_NotFoundWhenMissing(t *testing.T) {
+	// Default fakeStore.getCoachReportByMockIDFunc returns ErrNotFound.
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.GetCoachReport(context.Background(), "user_1", "mock-123")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestGetCoachReport_HappyPath(t *testing.T) {
+	want := domain.CoachReport{
+		MockID:     "mock-123",
+		Content:    "## Overall Performance\nsome report",
+		TokensUsed: 800,
+		Model:      "gemini-test",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store := &fakeStore{
+		getCoachReportByMockIDFunc: func(_ context.Context, mockID, userID string) (domain.CoachReport, error) {
+			require.Equal(t, "mock-123", mockID)
+			require.Equal(t, "user_1", userID)
+			return want, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+
+	got, err := svc.GetCoachReport(context.Background(), "user_1", "mock-123")
+	require.NoError(t, err)
+	require.Equal(t, want, got)
 }
