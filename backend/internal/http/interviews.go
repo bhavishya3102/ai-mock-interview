@@ -41,6 +41,9 @@ type InterviewService interface {
 	ListFeedback(ctx context.Context, clerkUserID, mockID string) ([]domain.UserAnswer, error)
 	TranscribeAudio(ctx context.Context, clerkUserID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
 	JudgeFollowUp(ctx context.Context, clerkUserID string, in service.JudgeFollowUpInput) (string, error)
+	UploadResume(ctx context.Context, clerkUserID string, pdf []byte, mimeType string) (domain.ResumeStatus, error)
+	GetResume(ctx context.Context, clerkUserID string) (domain.ResumeStatus, error)
+	DeleteResume(ctx context.Context, clerkUserID string) error
 }
 
 // InterviewHandler holds dependencies for the 5 interview endpoints.
@@ -151,23 +154,32 @@ func (h *InterviewHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 type submitAnswerRequest struct {
-	QuestionIndex int    `json:"questionIndex" validate:"gte=0,lte=4"`
-	UserAnswer    string `json:"userAnswer"    validate:"required,min=1,max=8000"`
+	QuestionIndex  int    `json:"questionIndex"  validate:"gte=0,lte=4"`
+	UserAnswer     string `json:"userAnswer"     validate:"required,min=1,max=8000"`
+	FillerCount    int    `json:"fillerCount"    validate:"gte=0,lte=10000"`
+	WordsPerMinute int    `json:"wordsPerMinute" validate:"gte=0,lte=1000"`
+	LongPauseCount int    `json:"longPauseCount" validate:"gte=0,lte=1000"`
 }
 
 type submitAnswerResponse struct {
-	QuestionIndex int       `json:"questionIndex"`
-	Rating        int       `json:"rating"`
-	Feedback      string    `json:"feedback"`
-	CreatedAt     time.Time `json:"createdAt"`
+	QuestionIndex  int       `json:"questionIndex"`
+	Rating         int       `json:"rating"`
+	Feedback       string    `json:"feedback"`
+	FillerCount    int       `json:"fillerCount"`
+	WordsPerMinute int       `json:"wordsPerMinute"`
+	LongPauseCount int       `json:"longPauseCount"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 func toSubmitAnswerResponse(a domain.UserAnswer) submitAnswerResponse {
 	return submitAnswerResponse{
-		QuestionIndex: a.QuestionIndex,
-		Rating:        a.Rating,
-		Feedback:      a.Feedback,
-		CreatedAt:     a.CreatedAt,
+		QuestionIndex:  a.QuestionIndex,
+		Rating:         a.Rating,
+		Feedback:       a.Feedback,
+		FillerCount:    a.FillerCount,
+		WordsPerMinute: a.WordsPerMinute,
+		LongPauseCount: a.LongPauseCount,
+		CreatedAt:      a.CreatedAt,
 	}
 }
 
@@ -176,24 +188,30 @@ func toSubmitAnswerResponse(a domain.UserAnswer) submitAnswerResponse {
 // reference answer) plus rating/feedback to be useful — submitAnswerResponse
 // stays minimal because the create-answer caller already has those locally.
 type feedbackResponse struct {
-	QuestionIndex int       `json:"questionIndex"`
-	Question      string    `json:"question"`
-	UserAnswer    string    `json:"userAnswer"`
-	CorrectAnswer string    `json:"correctAnswer"`
-	Rating        int       `json:"rating"`
-	Feedback      string    `json:"feedback"`
-	CreatedAt     time.Time `json:"createdAt"`
+	QuestionIndex  int       `json:"questionIndex"`
+	Question       string    `json:"question"`
+	UserAnswer     string    `json:"userAnswer"`
+	CorrectAnswer  string    `json:"correctAnswer"`
+	Rating         int       `json:"rating"`
+	Feedback       string    `json:"feedback"`
+	FillerCount    int       `json:"fillerCount"`
+	WordsPerMinute int       `json:"wordsPerMinute"`
+	LongPauseCount int       `json:"longPauseCount"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 func toFeedbackResponse(a domain.UserAnswer) feedbackResponse {
 	return feedbackResponse{
-		QuestionIndex: a.QuestionIndex,
-		Question:      a.QuestionText,
-		UserAnswer:    a.UserAnswer,
-		CorrectAnswer: a.CorrectAnswer,
-		Rating:        a.Rating,
-		Feedback:      a.Feedback,
-		CreatedAt:     a.CreatedAt,
+		QuestionIndex:  a.QuestionIndex,
+		Question:       a.QuestionText,
+		UserAnswer:     a.UserAnswer,
+		CorrectAnswer:  a.CorrectAnswer,
+		Rating:         a.Rating,
+		Feedback:       a.Feedback,
+		FillerCount:    a.FillerCount,
+		WordsPerMinute: a.WordsPerMinute,
+		LongPauseCount: a.LongPauseCount,
+		CreatedAt:      a.CreatedAt,
 	}
 }
 
@@ -214,9 +232,12 @@ func (h *InterviewHandler) SubmitAnswer(w http.ResponseWriter, r *http.Request) 
 	}
 
 	a, err := h.svc.SubmitAnswer(r.Context(), userID, service.SubmitAnswerInput{
-		MockID:        mockID,
-		QuestionIndex: req.QuestionIndex,
-		UserAnswer:    req.UserAnswer,
+		MockID:         mockID,
+		QuestionIndex:  req.QuestionIndex,
+		UserAnswer:     req.UserAnswer,
+		FillerCount:    req.FillerCount,
+		WordsPerMinute: req.WordsPerMinute,
+		LongPauseCount: req.LongPauseCount,
 	})
 	if err != nil {
 		h.respondErr(w, r, err, nil)

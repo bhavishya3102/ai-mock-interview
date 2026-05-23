@@ -58,6 +58,17 @@ var transcribeSchema = &genai.Schema{
 	PropertyOrdering: []string{"transcript", "wordsPerMinute"},
 }
 
+// resumeExtractSchema constrains ExtractResumeText: Gemini reads the uploaded
+// PDF and returns its text content as a single plain-text field.
+var resumeExtractSchema = &genai.Schema{
+	Type: genai.TypeObject,
+	Properties: map[string]*genai.Schema{
+		"resumeText": {Type: genai.TypeString},
+	},
+	Required:         []string{"resumeText"},
+	PropertyOrdering: []string{"resumeText"},
+}
+
 // answerEvalSchema constrains the LLM output for answer evaluation. The
 // rating is bounded to 1..10 to match the user_answers.rating CHECK constraint.
 var answerEvalSchema = &genai.Schema{

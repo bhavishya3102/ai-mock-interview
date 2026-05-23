@@ -8,6 +8,21 @@ VALUES ($1)
 ON CONFLICT (clerk_user_id)
 DO UPDATE SET updated_at = now();
 
+-- name: SetUserResume :exec
+UPDATE users
+SET resume_text = $2, resume_uploaded_at = now()
+WHERE clerk_user_id = $1;
+
+-- name: GetUserResume :one
+SELECT resume_text, resume_uploaded_at
+FROM users
+WHERE clerk_user_id = $1;
+
+-- name: ClearUserResume :exec
+UPDATE users
+SET resume_text = NULL, resume_uploaded_at = NULL
+WHERE clerk_user_id = $1;
+
 -- name: CreateInterview :exec
 INSERT INTO mock_interviews (
     mock_id, clerk_user_id, job_position, job_description,
@@ -30,18 +45,23 @@ WHERE mock_id = $1 AND clerk_user_id = $2;
 -- name: UpsertAnswer :exec
 INSERT INTO user_answers (
     mock_id, clerk_user_id, question_index, question_text,
-    correct_answer, user_answer, rating, feedback
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    correct_answer, user_answer, rating, feedback,
+    filler_count, words_per_minute, long_pause_count
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (mock_id, question_index, clerk_user_id) DO UPDATE
-SET question_text  = EXCLUDED.question_text,
-    correct_answer = EXCLUDED.correct_answer,
-    user_answer    = EXCLUDED.user_answer,
-    rating         = EXCLUDED.rating,
-    feedback       = EXCLUDED.feedback;
+SET question_text     = EXCLUDED.question_text,
+    correct_answer    = EXCLUDED.correct_answer,
+    user_answer       = EXCLUDED.user_answer,
+    rating            = EXCLUDED.rating,
+    feedback          = EXCLUDED.feedback,
+    filler_count      = EXCLUDED.filler_count,
+    words_per_minute  = EXCLUDED.words_per_minute,
+    long_pause_count  = EXCLUDED.long_pause_count;
 
 -- name: ListAnswersByMockID :many
 SELECT mock_id, clerk_user_id, question_index, question_text,
-       correct_answer, user_answer, rating, feedback, created_at
+       correct_answer, user_answer, rating, feedback, created_at,
+       filler_count, words_per_minute, long_pause_count
 FROM user_answers
 WHERE mock_id = $1 AND clerk_user_id = $2
 ORDER BY question_index ASC;

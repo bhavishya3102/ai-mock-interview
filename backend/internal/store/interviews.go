@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 	"github.com/jackc/pgx/v5"
@@ -34,6 +35,52 @@ func (r *InterviewRepo) UpsertUser(ctx context.Context, clerkUserID string) erro
 	           DO UPDATE SET updated_at = now()`
 	if _, err := r.pool.Exec(ctx, q, clerkUserID); err != nil {
 		return fmt.Errorf("upsert user: %w", err)
+	}
+	return nil
+}
+
+// SetUserResume stores the candidate's extracted resume text and stamps the
+// upload time. Assumes the users row already exists (callers UpsertUser first).
+func (r *InterviewRepo) SetUserResume(ctx context.Context, clerkUserID, resumeText string) error {
+	const q = `UPDATE users
+	           SET resume_text = $2, resume_uploaded_at = now()
+	           WHERE clerk_user_id = $1`
+	if _, err := r.pool.Exec(ctx, q, clerkUserID, resumeText); err != nil {
+		return fmt.Errorf("set user resume: %w", err)
+	}
+	return nil
+}
+
+// GetUserResume returns the stored resume text and its upload time. When no
+// resume is on file, returns empty text and a zero time with a nil error —
+// "no resume" is a normal state, not an error.
+func (r *InterviewRepo) GetUserResume(ctx context.Context, clerkUserID string) (string, time.Time, error) {
+	const q = `SELECT resume_text, resume_uploaded_at
+	           FROM users WHERE clerk_user_id = $1`
+	var (
+		text       *string
+		uploadedAt *time.Time
+	)
+	if err := r.pool.QueryRow(ctx, q, clerkUserID).Scan(&text, &uploadedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", time.Time{}, nil
+		}
+		return "", time.Time{}, fmt.Errorf("get user resume: %w", err)
+	}
+	if text == nil || uploadedAt == nil {
+		return "", time.Time{}, nil
+	}
+	return *text, *uploadedAt, nil
+}
+
+// ClearUserResume removes the stored resume, returning the user to the
+// no-resume state.
+func (r *InterviewRepo) ClearUserResume(ctx context.Context, clerkUserID string) error {
+	const q = `UPDATE users
+	           SET resume_text = NULL, resume_uploaded_at = NULL
+	           WHERE clerk_user_id = $1`
+	if _, err := r.pool.Exec(ctx, q, clerkUserID); err != nil {
+		return fmt.Errorf("clear user resume: %w", err)
 	}
 	return nil
 }

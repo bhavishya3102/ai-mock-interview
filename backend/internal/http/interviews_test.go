@@ -37,6 +37,9 @@ type fakeSvc struct {
 	listFeedbackFunc    func(ctx context.Context, userID, mockID string) ([]domain.UserAnswer, error)
 	transcribeAudioFunc func(ctx context.Context, userID, mockID string, audio []byte, mimeType string, longPauseCount int) (domain.TranscriptResult, error)
 	judgeFollowUpFunc   func(ctx context.Context, userID string, in service.JudgeFollowUpInput) (string, error)
+	uploadResumeFunc    func(ctx context.Context, userID string, pdf []byte, mimeType string) (domain.ResumeStatus, error)
+	getResumeFunc       func(ctx context.Context, userID string) (domain.ResumeStatus, error)
+	deleteResumeFunc    func(ctx context.Context, userID string) error
 }
 
 func (f *fakeSvc) CreateInterview(ctx context.Context, userID string, in service.CreateInterviewInput) (domain.MockInterview, error) {
@@ -66,6 +69,24 @@ func (f *fakeSvc) JudgeFollowUp(ctx context.Context, userID string, in service.J
 	}
 	return f.judgeFollowUpFunc(ctx, userID, in)
 }
+func (f *fakeSvc) UploadResume(ctx context.Context, userID string, pdf []byte, mimeType string) (domain.ResumeStatus, error) {
+	if f.uploadResumeFunc == nil {
+		return domain.ResumeStatus{}, nil
+	}
+	return f.uploadResumeFunc(ctx, userID, pdf, mimeType)
+}
+func (f *fakeSvc) GetResume(ctx context.Context, userID string) (domain.ResumeStatus, error) {
+	if f.getResumeFunc == nil {
+		return domain.ResumeStatus{}, nil
+	}
+	return f.getResumeFunc(ctx, userID)
+}
+func (f *fakeSvc) DeleteResume(ctx context.Context, userID string) error {
+	if f.deleteResumeFunc == nil {
+		return nil
+	}
+	return f.deleteResumeFunc(ctx, userID)
+}
 
 // withUserID returns a request whose context carries a Clerk user ID — used
 // to simulate the auth middleware having already run.
@@ -85,6 +106,9 @@ func interviewRouter(h *InterviewHandler) http.Handler {
 	r.Post("/api/v1/interviews/{mockId}/answers", h.SubmitAnswer)
 	r.Get("/api/v1/interviews/{mockId}/feedback", h.ListFeedback)
 	r.Post("/api/v1/interviews/{mockId}/transcribe", h.Transcribe)
+	r.Post("/api/v1/resume", h.UploadResume)
+	r.Get("/api/v1/resume", h.GetResume)
+	r.Delete("/api/v1/resume", h.DeleteResume)
 	return r
 }
 

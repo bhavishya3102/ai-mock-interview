@@ -17,13 +17,39 @@ type fakeStore struct {
 	upsertCalls          []string
 	createInterviewCalls []domain.MockInterview
 	upsertAnswerCalls    []domain.UserAnswer
+	setResumeCalls       []string
 
 	upsertUserFunc           func(ctx context.Context, userID string) error
+	setUserResumeFunc        func(ctx context.Context, userID, resumeText string) error
+	getUserResumeFunc        func(ctx context.Context, userID string) (string, time.Time, error)
+	clearUserResumeFunc      func(ctx context.Context, userID string) error
 	createInterviewFunc      func(ctx context.Context, m domain.MockInterview) error
 	listInterviewsByUserFunc func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
 	getInterviewByMockIDFunc func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
 	upsertAnswerFunc         func(ctx context.Context, a domain.UserAnswer) error
 	listAnswersByMockIDFunc  func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
+}
+
+func (f *fakeStore) SetUserResume(ctx context.Context, userID, resumeText string) error {
+	f.setResumeCalls = append(f.setResumeCalls, resumeText)
+	if f.setUserResumeFunc != nil {
+		return f.setUserResumeFunc(ctx, userID, resumeText)
+	}
+	return nil
+}
+
+func (f *fakeStore) GetUserResume(ctx context.Context, userID string) (string, time.Time, error) {
+	if f.getUserResumeFunc != nil {
+		return f.getUserResumeFunc(ctx, userID)
+	}
+	return "", time.Time{}, nil
+}
+
+func (f *fakeStore) ClearUserResume(ctx context.Context, userID string) error {
+	if f.clearUserResumeFunc != nil {
+		return f.clearUserResumeFunc(ctx, userID)
+	}
+	return nil
 }
 
 func (f *fakeStore) UpsertUser(ctx context.Context, userID string) error {
@@ -75,7 +101,15 @@ type fakeLLM struct {
 	generateQuestionsFunc func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
 	evaluateAnswerFunc    func(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
 	transcribeAudioFunc   func(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	extractResumeTextFunc func(ctx context.Context, pdf []byte, mimeType string) (string, error)
 	judgeFollowUpFunc     func(ctx context.Context, in domain.FollowUpSeed) (string, error)
+}
+
+func (f *fakeLLM) ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error) {
+	if f.extractResumeTextFunc != nil {
+		return f.extractResumeTextFunc(ctx, pdf, mimeType)
+	}
+	return "extracted resume text", nil
 }
 
 func (f *fakeLLM) GenerateQuestions(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error) {
@@ -572,4 +606,124 @@ func TestJudgeFollowUp_QuestionIndexOutOfRange(t *testing.T) {
 		MainAnswer:    "an answer",
 	})
 	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+// --- Resume ---
+
+func TestUploadResume_RequiresUserID(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.UploadResume(context.Background(), "", []byte("%PDF-data"), "application/pdf")
+	require.ErrorIs(t, err, domain.ErrUnauthorized)
+}
+
+func TestUploadResume_EmptyFile(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	_, err := svc.UploadResume(context.Background(), "user_1", nil, "application/pdf")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestUploadResume_HappyPath(t *testing.T) {
+	uploadedAt := time.Now().UTC()
+	store := &fakeStore{
+		getUserResumeFunc: func(_ context.Context, _ string) (string, time.Time, error) {
+			return "  Jane Doe resume  ", uploadedAt, nil
+		},
+	}
+	llm := &fakeLLM{
+		extractResumeTextFunc: func(_ context.Context, _ []byte, mimeType string) (string, error) {
+			require.Equal(t, "application/pdf", mimeType)
+			return "  Jane Doe — Senior Engineer  ", nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	status, err := svc.UploadResume(context.Background(), "user_1", []byte("%PDF-1.7 bytes"), "application/pdf")
+	require.NoError(t, err)
+	require.True(t, status.Attached)
+	require.Equal(t, uploadedAt, status.UploadedAt)
+	require.Equal(t, []string{"Jane Doe — Senior Engineer"}, store.setResumeCalls,
+		"extracted text must be trimmed before storage")
+}
+
+func TestUploadResume_NoReadableText(t *testing.T) {
+	llm := &fakeLLM{
+		extractResumeTextFunc: func(_ context.Context, _ []byte, _ string) (string, error) {
+			return "   ", nil
+		},
+	}
+	svc := NewInterviewService(&fakeStore{}, llm)
+	_, err := svc.UploadResume(context.Background(), "user_1", []byte("%PDF-"), "application/pdf")
+	require.ErrorIs(t, err, domain.ErrValidation)
+}
+
+func TestUploadResume_LLMFailureMaps(t *testing.T) {
+	llm := &fakeLLM{
+		extractResumeTextFunc: func(_ context.Context, _ []byte, _ string) (string, error) {
+			return "", errors.Join(domain.ErrLLM, errors.New("model down"))
+		},
+	}
+	svc := NewInterviewService(&fakeStore{}, llm)
+	_, err := svc.UploadResume(context.Background(), "user_1", []byte("%PDF-"), "application/pdf")
+	require.ErrorIs(t, err, domain.ErrLLM)
+}
+
+func TestGetResume_ReportsAttached(t *testing.T) {
+	uploadedAt := time.Now().UTC()
+	store := &fakeStore{
+		getUserResumeFunc: func(_ context.Context, _ string) (string, time.Time, error) {
+			return "stored resume text", uploadedAt, nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	status, err := svc.GetResume(context.Background(), "user_1")
+	require.NoError(t, err)
+	require.True(t, status.Attached)
+	require.Equal(t, uploadedAt, status.UploadedAt)
+}
+
+func TestGetResume_ReportsNotAttached(t *testing.T) {
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+	status, err := svc.GetResume(context.Background(), "user_1")
+	require.NoError(t, err)
+	require.False(t, status.Attached)
+	require.True(t, status.UploadedAt.IsZero())
+}
+
+func TestDeleteResume_CallsClear(t *testing.T) {
+	cleared := false
+	store := &fakeStore{
+		clearUserResumeFunc: func(_ context.Context, userID string) error {
+			require.Equal(t, "user_1", userID)
+			cleared = true
+			return nil
+		},
+	}
+	svc := NewInterviewService(store, &fakeLLM{})
+	require.NoError(t, svc.DeleteResume(context.Background(), "user_1"))
+	require.True(t, cleared)
+}
+
+func TestCreateInterview_PassesResumeToLLM(t *testing.T) {
+	store := &fakeStore{
+		getUserResumeFunc: func(_ context.Context, _ string) (string, time.Time, error) {
+			return "Jane led a Postgres migration at Acme", time.Now().UTC(), nil
+		},
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+	}
+	var seenSeed domain.InterviewSeed
+	llm := &fakeLLM{
+		generateQuestionsFunc: func(_ context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error) {
+			seenSeed = in
+			return defaultQuestions(), nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+	_, err := svc.CreateInterview(context.Background(), "user_1", CreateInterviewInput{
+		JobPosition: "Backend Engineer", JobDescription: validJobDescription, YearsExperience: 5,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "Jane led a Postgres migration at Acme", seenSeed.ResumeText,
+		"stored resume text must flow into the question-generation seed")
 }

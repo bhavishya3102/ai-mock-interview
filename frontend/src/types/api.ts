@@ -29,6 +29,9 @@ export interface UserAnswer {
   correctAnswer: string;
   feedback: string;
   rating: number;
+  fillerCount: number;
+  wordsPerMinute: number;
+  longPauseCount: number;
   createdAt: string;
 }
 
@@ -41,6 +44,14 @@ export interface CreateInterviewInput {
 export interface SubmitAnswerInput {
   questionIndex: number;
   userAnswer: string;
+  fillerCount: number;
+  wordsPerMinute: number;
+  longPauseCount: number;
+}
+
+export interface ResumeStatus {
+  attached: boolean;
+  uploadedAt: string | null;
 }
 
 export interface ListResponse<T> {

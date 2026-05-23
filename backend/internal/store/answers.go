@@ -24,14 +24,18 @@ func NewAnswerRepo(pool *pgxpool.Pool) *AnswerRepo {
 func (r *AnswerRepo) UpsertAnswer(ctx context.Context, a domain.UserAnswer) error {
 	const q = `INSERT INTO user_answers (
 	    mock_id, clerk_user_id, question_index, question_text,
-	    correct_answer, user_answer, rating, feedback
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	    correct_answer, user_answer, rating, feedback,
+	    filler_count, words_per_minute, long_pause_count
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	ON CONFLICT (mock_id, question_index, clerk_user_id) DO UPDATE
-	SET question_text  = EXCLUDED.question_text,
-	    correct_answer = EXCLUDED.correct_answer,
-	    user_answer    = EXCLUDED.user_answer,
-	    rating         = EXCLUDED.rating,
-	    feedback       = EXCLUDED.feedback`
+	SET question_text     = EXCLUDED.question_text,
+	    correct_answer    = EXCLUDED.correct_answer,
+	    user_answer       = EXCLUDED.user_answer,
+	    rating            = EXCLUDED.rating,
+	    feedback          = EXCLUDED.feedback,
+	    filler_count      = EXCLUDED.filler_count,
+	    words_per_minute  = EXCLUDED.words_per_minute,
+	    long_pause_count  = EXCLUDED.long_pause_count`
 
 	if _, err := r.pool.Exec(
 		ctx, q,
@@ -43,6 +47,9 @@ func (r *AnswerRepo) UpsertAnswer(ctx context.Context, a domain.UserAnswer) erro
 		a.UserAnswer,
 		a.Rating,
 		a.Feedback,
+		a.FillerCount,
+		a.WordsPerMinute,
+		a.LongPauseCount,
 	); err != nil {
 		return fmt.Errorf("upsert answer: %w", err)
 	}
@@ -57,7 +64,8 @@ func (r *AnswerRepo) ListAnswersByMockID(
 	clerkUserID string,
 ) ([]domain.UserAnswer, error) {
 	const q = `SELECT mock_id, clerk_user_id, question_index, question_text,
-	                  correct_answer, user_answer, rating, feedback, created_at
+	                  correct_answer, user_answer, rating, feedback, created_at,
+	                  filler_count, words_per_minute, long_pause_count
 	           FROM user_answers
 	           WHERE mock_id = $1 AND clerk_user_id = $2
 	           ORDER BY question_index ASC`
@@ -81,6 +89,9 @@ func (r *AnswerRepo) ListAnswersByMockID(
 			&a.Rating,
 			&a.Feedback,
 			&a.CreatedAt,
+			&a.FillerCount,
+			&a.WordsPerMinute,
+			&a.LongPauseCount,
 		); err != nil {
 			return nil, fmt.Errorf("scan answer row: %w", err)
 		}

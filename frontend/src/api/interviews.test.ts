@@ -40,6 +40,9 @@ describe("api/interviews against MSW", () => {
     const answer = await submitAnswer(SAMPLE_INTERVIEW.mockId, {
       questionIndex: 0,
       userAnswer: "Detailed answer.",
+      fillerCount: 0,
+      wordsPerMinute: 0,
+      longPauseCount: 0,
     });
     expect(typeof answer.rating).toBe("number");
     expect(answer.rating).toBeGreaterThanOrEqual(1);

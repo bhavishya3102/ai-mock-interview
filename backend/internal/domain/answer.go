@@ -9,16 +9,23 @@ type Evaluation struct {
 }
 
 // UserAnswer is the persisted aggregate for a single answered question.
+// FillerCount / WordsPerMinute / LongPauseCount are speech-delivery metrics
+// aggregated across all recordings for the question (main + follow-ups).
+// Zero values are valid — e.g. WordsPerMinute=0 when audio was too short to
+// estimate, or when the answer was typed.
 type UserAnswer struct {
-	MockID        string    `json:"-"`
-	ClerkUserID   string    `json:"-"`
-	QuestionIndex int       `json:"questionIndex"`
-	QuestionText  string    `json:"-"`
-	CorrectAnswer string    `json:"-"`
-	UserAnswer    string    `json:"-"`
-	Rating        int       `json:"rating"`
-	Feedback      string    `json:"feedback"`
-	CreatedAt     time.Time `json:"createdAt"`
+	MockID         string    `json:"-"`
+	ClerkUserID    string    `json:"-"`
+	QuestionIndex  int       `json:"questionIndex"`
+	QuestionText   string    `json:"-"`
+	CorrectAnswer  string    `json:"-"`
+	UserAnswer     string    `json:"-"`
+	Rating         int       `json:"rating"`
+	Feedback       string    `json:"feedback"`
+	FillerCount    int       `json:"fillerCount"`
+	WordsPerMinute int       `json:"wordsPerMinute"`
+	LongPauseCount int       `json:"longPauseCount"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 // AnswerSeed is the input passed to the LLM to evaluate a user's answer.

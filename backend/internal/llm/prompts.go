@@ -18,6 +18,16 @@ const MaxFollowUpsPerQuestion = 2
 const QuestionCount = 5
 
 func buildQuestionPrompt(in domain.InterviewSeed) string {
+	resumeSection := ""
+	resumeConstraint := ""
+	if strings.TrimSpace(in.ResumeText) != "" {
+		resumeSection = fmt.Sprintf(`
+Candidate's resume:
+%s
+`, in.ResumeText)
+		resumeConstraint = "\n- At least 2 questions MUST reference specific, concrete details from the candidate's resume (a named project, employer, technology, or claim) — e.g. \"You wrote that you led a database migration at X — walk me through it.\" Quote or paraphrase the resume detail so the candidate knows exactly what you mean. Do not invent details that are not in the resume."
+	}
+
 	return fmt.Sprintf(`You are an experienced technical interviewer.
 
 Generate exactly %d distinct interview questions and their model answers for the following candidate context. Questions must be open-ended (no yes/no questions), ordered from easier to harder, and tightly scoped to the role and experience level.
@@ -26,16 +36,18 @@ Job position: %s
 Years of experience: %d
 Job description:
 %s
-
+%s
 Constraints:
 - Each question must be answerable verbally in 2–4 minutes by a competent candidate.
 - The "answer" field must be a strong reference answer the interviewer would consider excellent.
-- Avoid questions that depend on company-internal context the candidate cannot know.
+- Avoid questions that depend on company-internal context the candidate cannot know.%s
 - Do NOT include numbering, prefaces, or any text outside the structured JSON output.`,
 		QuestionCount,
 		in.JobPosition,
 		in.YearsExperience,
 		in.JobDescription,
+		resumeSection,
+		resumeConstraint,
 	)
 }
 

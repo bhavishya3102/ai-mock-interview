@@ -1,5 +1,11 @@
 import { http, HttpResponse } from "msw";
-import type { Interview, InterviewSummary, ListResponse, UserAnswer } from "@/types/api";
+import type {
+  Interview,
+  InterviewSummary,
+  ListResponse,
+  ResumeStatus,
+  UserAnswer,
+} from "@/types/api";
 
 const BASE = "*/api/v1";
 
@@ -34,6 +40,9 @@ const SAMPLE_FEEDBACK: UserAnswer[] = [
     correctAnswer: "Strong elevator pitch.",
     feedback: "Add metrics.",
     rating: 8,
+    fillerCount: 2,
+    wordsPerMinute: 140,
+    longPauseCount: 1,
     createdAt: "2025-04-01T10:05:00Z",
   },
 ];
@@ -66,7 +75,13 @@ export const handlers = [
     );
   }),
   http.post(`${BASE}/interviews/:mockId/answers`, async ({ request }) => {
-    const payload = (await request.json()) as { questionIndex: number; userAnswer: string };
+    const payload = (await request.json()) as {
+      questionIndex: number;
+      userAnswer: string;
+      fillerCount?: number;
+      wordsPerMinute?: number;
+      longPauseCount?: number;
+    };
     return HttpResponse.json<UserAnswer>(
       {
         questionIndex: payload.questionIndex,
@@ -75,6 +90,9 @@ export const handlers = [
         userAnswer: payload.userAnswer,
         feedback: "Solid response.",
         rating: 7,
+        fillerCount: payload.fillerCount ?? 0,
+        wordsPerMinute: payload.wordsPerMinute ?? 0,
+        longPauseCount: payload.longPauseCount ?? 0,
         createdAt: new Date().toISOString(),
       },
       { status: 201 },
@@ -89,6 +107,16 @@ export const handlers = [
       analysis: SAMPLE_ANALYSIS,
     }),
   ),
+  http.get(`${BASE}/resume`, () =>
+    HttpResponse.json<ResumeStatus>({ attached: false, uploadedAt: null }),
+  ),
+  http.post(`${BASE}/resume`, () =>
+    HttpResponse.json<ResumeStatus>({
+      attached: true,
+      uploadedAt: "2026-05-15T10:00:00Z",
+    }),
+  ),
+  http.delete(`${BASE}/resume`, () => new HttpResponse(null, { status: 204 })),
 ];
 
 const SAMPLE_ANALYSIS = {

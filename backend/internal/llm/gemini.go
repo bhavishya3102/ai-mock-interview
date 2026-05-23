@@ -141,6 +141,59 @@ func (c *Client) TranscribeAudio(ctx context.Context, audio []byte, mimeType str
 	}, nil
 }
 
+// ExtractResumeText sends a resume PDF to Gemini and returns its text content
+// as clean plain text. Run once at upload time; the stored text is reused for
+// every interview the candidate creates.
+//
+// mimeType is expected to be "application/pdf". Empty input is rejected before
+// the API round-trip to save quota.
+func (c *Client) ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error) {
+	if len(pdf) == 0 {
+		return "", fmt.Errorf("gemini extract resume: empty file: %w", domain.ErrValidation)
+	}
+	if mimeType == "" {
+		return "", fmt.Errorf("gemini extract resume: empty mime type: %w", domain.ErrValidation)
+	}
+
+	cfg := &genai.GenerateContentConfig{
+		Temperature:      genai.Ptr[float32](0.0),
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   resumeExtractSchema,
+	}
+
+	prompt := "Extract the full text content of this resume/CV PDF as clean, " +
+		"readable plain text. Preserve section headings, role titles, company " +
+		"names, dates, and bullet points. Do NOT summarize, reword, or omit " +
+		"anything. No markdown, no commentary. Return JSON with field " +
+		"\"resumeText\" containing the extracted text (empty string if the file " +
+		"has no readable resume content)."
+
+	contents := []*genai.Content{
+		genai.NewContentFromParts([]*genai.Part{
+			genai.NewPartFromText(prompt),
+			genai.NewPartFromBytes(pdf, mimeType),
+		}, genai.RoleUser),
+	}
+
+	resp, err := c.sdk.Models.GenerateContent(ctx, c.model, contents, cfg)
+	if err != nil {
+		return "", fmt.Errorf("gemini extract resume: %w", errors.Join(domain.ErrLLM, err))
+	}
+
+	raw := resp.Text()
+	if raw == "" {
+		return "", fmt.Errorf("gemini empty response: %w", domain.ErrLLM)
+	}
+
+	var out struct {
+		ResumeText string `json:"resumeText"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return "", fmt.Errorf("gemini decode resume: %w", errors.Join(domain.ErrLLM, err))
+	}
+	return out.ResumeText, nil
+}
+
 // JudgeFollowUp asks the model whether the candidate needs one more
 // probing follow-up. Returns the follow-up question string, or empty string
 // if the model judges the answer good enough. Output is constrained by

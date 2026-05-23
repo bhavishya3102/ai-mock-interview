@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { AddInterviewDialog } from "@/components/dashboard/AddInterviewDialog";
 import { InterviewGrid } from "@/components/dashboard/InterviewGrid";
+import { ResumeCard } from "@/components/dashboard/ResumeCard";
 import { useInterviews } from "@/hooks/useInterviews";
 
 export default function Dashboard(): ReactElement {
@@ -21,6 +22,10 @@ export default function Dashboard(): ReactElement {
         </div>
         <AddInterviewDialog />
       </header>
+
+      <div className="mt-8">
+        <ResumeCard />
+      </div>
 
       <section className="mt-12">
         {isLoading ? (

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 	"github.com/google/uuid"
@@ -18,6 +19,9 @@ import (
 // Defined here on the consumer side per Go interface guidelines.
 type Store interface {
 	UpsertUser(ctx context.Context, clerkUserID string) error
+	SetUserResume(ctx context.Context, clerkUserID, resumeText string) error
+	GetUserResume(ctx context.Context, clerkUserID string) (string, time.Time, error)
+	ClearUserResume(ctx context.Context, clerkUserID string) error
 	CreateInterview(ctx context.Context, m domain.MockInterview) error
 	ListInterviewsByUser(ctx context.Context, clerkUserID string, limit int) ([]domain.InterviewSummary, error)
 	GetInterviewByMockID(ctx context.Context, mockID, clerkUserID string) (domain.MockInterview, error)
@@ -30,8 +34,14 @@ type LLMClient interface {
 	GenerateQuestions(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
 	EvaluateAnswer(ctx context.Context, in domain.AnswerSeed) (domain.Evaluation, error)
 	TranscribeAudio(ctx context.Context, audio []byte, mimeType string) (domain.TranscriptResult, error)
+	ExtractResumeText(ctx context.Context, pdf []byte, mimeType string) (string, error)
 	JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error)
 }
+
+// maxResumeTextLen caps the stored extracted resume text. A real resume is
+// well under this; the cap keeps the question-generation prompt bounded if
+// extraction returns something pathological.
+const maxResumeTextLen = 20000
 
 // MaxFollowUpsPerQuestion is the hard cap on follow-ups per main question.
 // Enforced by JudgeFollowUp so a misbehaving prompt cannot loop forever.
@@ -47,10 +57,16 @@ type CreateInterviewInput struct {
 }
 
 // SubmitAnswerInput is the validated input for SubmitAnswer.
+// FillerCount / WordsPerMinute / LongPauseCount are speech-delivery metrics
+// the client aggregates across all recordings for the question. Negative
+// values are clamped to 0 by the service.
 type SubmitAnswerInput struct {
-	MockID        string
-	QuestionIndex int
-	UserAnswer    string
+	MockID         string
+	QuestionIndex  int
+	UserAnswer     string
+	FillerCount    int
+	WordsPerMinute int
+	LongPauseCount int
 }
 
 // JudgeFollowUpInput is the validated input for JudgeFollowUp.
@@ -92,10 +108,17 @@ func (s *InterviewService) CreateInterview(
 		return domain.MockInterview{}, fmt.Errorf("create interview: %w", err)
 	}
 
+	// Resume is optional: an empty string just yields role-only questions.
+	resumeText, _, err := s.store.GetUserResume(ctx, clerkUserID)
+	if err != nil {
+		return domain.MockInterview{}, fmt.Errorf("create interview: %w", err)
+	}
+
 	questions, err := s.llm.GenerateQuestions(ctx, domain.InterviewSeed{
 		JobPosition:     in.JobPosition,
 		JobDescription:  in.JobDescription,
 		YearsExperience: in.YearsExperience,
+		ResumeText:      resumeText,
 	})
 	if err != nil {
 		return domain.MockInterview{}, fmt.Errorf("create interview: %w", err)
@@ -209,14 +232,17 @@ func (s *InterviewService) SubmitAnswer(
 	}
 
 	a := domain.UserAnswer{
-		MockID:        mi.MockID,
-		ClerkUserID:   clerkUserID,
-		QuestionIndex: in.QuestionIndex,
-		QuestionText:  qa.Question,
-		CorrectAnswer: qa.Answer,
-		UserAnswer:    in.UserAnswer,
-		Rating:        eval.Rating,
-		Feedback:      eval.Feedback,
+		MockID:         mi.MockID,
+		ClerkUserID:    clerkUserID,
+		QuestionIndex:  in.QuestionIndex,
+		QuestionText:   qa.Question,
+		CorrectAnswer:  qa.Answer,
+		UserAnswer:     in.UserAnswer,
+		Rating:         eval.Rating,
+		Feedback:       eval.Feedback,
+		FillerCount:    clampNonNeg(in.FillerCount, 10000),
+		WordsPerMinute: clampNonNeg(in.WordsPerMinute, 1000),
+		LongPauseCount: clampNonNeg(in.LongPauseCount, 1000),
 	}
 	if err := s.store.UpsertAnswer(ctx, a); err != nil {
 		return domain.UserAnswer{}, fmt.Errorf("submit answer: %w", err)
@@ -235,6 +261,79 @@ func (s *InterviewService) SubmitAnswer(
 	// fundamentally wrong with the connection — surface as a server fault,
 	// not silently succeed.
 	return domain.UserAnswer{}, errors.New("submit answer: upserted row missing from readback")
+}
+
+// UploadResume extracts text from the candidate's resume PDF via the LLM and
+// stores it on the user. The stored text is reused for every interview the
+// candidate later creates. Re-uploading replaces the prior resume.
+func (s *InterviewService) UploadResume(
+	ctx context.Context,
+	clerkUserID string,
+	pdf []byte,
+	mimeType string,
+) (domain.ResumeStatus, error) {
+	if clerkUserID == "" {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: %w", domain.ErrUnauthorized)
+	}
+	if len(pdf) == 0 {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: empty file: %w", domain.ErrValidation)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: %w", err)
+	}
+
+	text, err := s.llm.ExtractResumeText(ctx, pdf, mimeType)
+	if err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: %w", err)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: no readable resume text: %w", domain.ErrValidation)
+	}
+	if r := []rune(text); len(r) > maxResumeTextLen {
+		text = string(r[:maxResumeTextLen])
+	}
+
+	if err := s.store.SetUserResume(ctx, clerkUserID, text); err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume: %w", err)
+	}
+	// Read back to get the DB-assigned upload timestamp.
+	_, uploadedAt, err := s.store.GetUserResume(ctx, clerkUserID)
+	if err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("upload resume readback: %w", err)
+	}
+	return domain.ResumeStatus{Attached: true, UploadedAt: uploadedAt}, nil
+}
+
+// GetResume reports whether the user has a resume on file and when it was
+// uploaded. The extracted text itself is never returned over the wire.
+func (s *InterviewService) GetResume(ctx context.Context, clerkUserID string) (domain.ResumeStatus, error) {
+	if clerkUserID == "" {
+		return domain.ResumeStatus{}, fmt.Errorf("get resume: %w", domain.ErrUnauthorized)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("get resume: %w", err)
+	}
+	text, uploadedAt, err := s.store.GetUserResume(ctx, clerkUserID)
+	if err != nil {
+		return domain.ResumeStatus{}, fmt.Errorf("get resume: %w", err)
+	}
+	return domain.ResumeStatus{Attached: text != "", UploadedAt: uploadedAt}, nil
+}
+
+// DeleteResume removes the stored resume. Idempotent — deleting when no
+// resume exists is a no-op success.
+func (s *InterviewService) DeleteResume(ctx context.Context, clerkUserID string) error {
+	if clerkUserID == "" {
+		return fmt.Errorf("delete resume: %w", domain.ErrUnauthorized)
+	}
+	if err := s.store.UpsertUser(ctx, clerkUserID); err != nil {
+		return fmt.Errorf("delete resume: %w", err)
+	}
+	if err := s.store.ClearUserResume(ctx, clerkUserID); err != nil {
+		return fmt.Errorf("delete resume: %w", err)
+	}
+	return nil
 }
 
 // JudgeFollowUp asks the LLM whether the candidate needs one more probing
@@ -369,6 +468,18 @@ func validateCreateInterview(in CreateInterviewInput) error {
 		return domain.ErrValidation
 	}
 	return nil
+}
+
+// clampNonNeg returns v clamped into [0, max]. Negative client inputs are
+// treated as zero rather than rejected — the metrics are advisory.
+func clampNonNeg(v, max int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func validateSubmitAnswer(in SubmitAnswerInput) error {

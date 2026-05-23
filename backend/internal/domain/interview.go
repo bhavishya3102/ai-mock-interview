@@ -11,11 +11,20 @@ type GeneratedQA struct {
 
 // InterviewSeed is the input passed to the LLM to produce questions. Kept
 // separate from CreateInterviewInput so the LLM layer doesn't depend on the
-// HTTP DTO.
+// HTTP DTO. ResumeText is the candidate's extracted resume; empty when no
+// resume is on file, in which case the prompt falls back to role-only.
 type InterviewSeed struct {
 	JobPosition     string
 	JobDescription  string
 	YearsExperience int
+	ResumeText      string
+}
+
+// ResumeStatus describes whether a user has a resume on file. UploadedAt is
+// the zero time when Attached is false.
+type ResumeStatus struct {
+	Attached   bool      `json:"attached"`
+	UploadedAt time.Time `json:"uploadedAt"`
 }
 
 // MockInterview is the persisted aggregate.

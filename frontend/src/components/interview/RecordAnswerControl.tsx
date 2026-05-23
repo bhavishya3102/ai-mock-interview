@@ -69,6 +69,40 @@ export function RecordAnswerControl({
   // because metrics for question N don't apply to question N+1.
   const [latestAnalysis, setLatestAnalysis] = useState<SpeechAnalysis | null>(null);
 
+  // Aggregated metrics across all recordings (main + follow-ups) for the
+  // current question — what we ultimately send with SubmitAnswer so the
+  // feedback page can show per-question delivery stats. A ref (not state)
+  // so finalize() reads the latest value synchronously from async callbacks.
+  // wpm is averaged over clips with wpm>0 (zero means "too short to estimate").
+  const metricsRef = useRef<{
+    fillerCount: number;
+    longPauseCount: number;
+    wpmSum: number;
+    wpmSamples: number;
+  }>({ fillerCount: 0, longPauseCount: 0, wpmSum: 0, wpmSamples: 0 });
+
+  function resetMetrics(): void {
+    metricsRef.current = { fillerCount: 0, longPauseCount: 0, wpmSum: 0, wpmSamples: 0 };
+  }
+
+  function addClipMetrics(a: SpeechAnalysis): void {
+    metricsRef.current.fillerCount += a.fillerCount;
+    metricsRef.current.longPauseCount += a.longPauseCount;
+    if (a.wordsPerMinute > 0) {
+      metricsRef.current.wpmSum += a.wordsPerMinute;
+      metricsRef.current.wpmSamples += 1;
+    }
+  }
+
+  function replaceWithClipMetrics(a: SpeechAnalysis): void {
+    metricsRef.current = {
+      fillerCount: a.fillerCount,
+      longPauseCount: a.longPauseCount,
+      wpmSum: a.wordsPerMinute > 0 ? a.wordsPerMinute : 0,
+      wpmSamples: a.wordsPerMinute > 0 ? 1 : 0,
+    };
+  }
+
   // Reset every transient piece of state when the active question changes.
   // Without this, partway-completed follow-ups from question N leak into N+1.
   useEffect(() => {
@@ -77,6 +111,7 @@ export function RecordAnswerControl({
     setCurrentFollowUp(null);
     setShowSavedHint(false);
     setLatestAnalysis(null);
+    resetMetrics();
     setTranscript("");
     judge.reset();
     submit.reset();
@@ -109,12 +144,17 @@ export function RecordAnswerControl({
   submitRef.current = submit;
 
   async function finalize(main: string, turnsList: FollowUpTurn[]): Promise<void> {
+    const m = metricsRef.current;
+    const wpm = m.wpmSamples > 0 ? Math.round(m.wpmSum / m.wpmSamples) : 0;
     try {
       await submitRef.current.mutateAsync({
         mockId,
         payload: {
           questionIndex,
           userAnswer: composeUserAnswer(main, turnsList),
+          fillerCount: m.fillerCount,
+          wordsPerMinute: wpm,
+          longPauseCount: m.longPauseCount,
         },
       });
       setShowSavedHint(true);
@@ -175,6 +215,7 @@ export function RecordAnswerControl({
         return;
       }
       let text = "";
+      let analysis: SpeechAnalysis | null = null;
       try {
         const result = await transcribe.mutateAsync({
           mockId,
@@ -182,6 +223,7 @@ export function RecordAnswerControl({
           longPauseCount: recording.longPauseCount,
         });
         text = result.transcript.trim();
+        analysis = result.analysis;
         setLatestAnalysis(result.analysis);
       } catch (err) {
         const message =
@@ -189,7 +231,7 @@ export function RecordAnswerControl({
         toast({ title: "Transcription failed", description: message, variant: "destructive" });
         return;
       }
-      if (!text) {
+      if (!text || !analysis) {
         toast({
           title: "No speech detected",
           description: "We couldn't hear anything intelligible. Speak closer to the mic and try again.",
@@ -200,11 +242,13 @@ export function RecordAnswerControl({
 
       if (!mainAnswer) {
         // First recording for this question — this is the main answer.
+        replaceWithClipMetrics(analysis);
         setMainAnswer(text);
         setTranscript(text);
         await askForNextFollowUp(text, []);
       } else if (currentFollowUp) {
         // Recording is the candidate's reply to the current follow-up.
+        addClipMetrics(analysis);
         const nextTurns: FollowUpTurn[] = [
           ...turns,
           { question: currentFollowUp, answer: text },
@@ -216,6 +260,7 @@ export function RecordAnswerControl({
       } else {
         // No active follow-up but mainAnswer exists — treat as a re-record of
         // the main answer (user used the Clear button, or hit Record again).
+        replaceWithClipMetrics(analysis);
         setMainAnswer(text);
         setTurns([]);
         setTranscript(text);
@@ -243,6 +288,7 @@ export function RecordAnswerControl({
     setCurrentFollowUp(null);
     setShowSavedHint(false);
     setLatestAnalysis(null);
+    resetMetrics();
     setTranscript("");
     judge.reset();
     submit.reset();

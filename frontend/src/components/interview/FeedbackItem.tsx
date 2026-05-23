@@ -1,5 +1,5 @@
 import type { ReactElement } from "react";
-import { ChevronDown, MessageSquare, Sparkles, User } from "lucide-react";
+import { ChevronDown, Gauge, MessageSquare, PauseCircle, Sparkles, User, Wind } from "lucide-react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -87,6 +87,13 @@ export function FeedbackItem({ item }: FeedbackItemProps): ReactElement {
 
       <CollapsibleContent className="overflow-hidden data-[state=closed]:animate-accordion-up data-[state=open]:animate-accordion-down">
         <div className="grid gap-4 border-t bg-secondary/30 p-5 text-sm md:grid-cols-2">
+          <div className="md:col-span-2">
+            <DeliveryStrip
+              fillerCount={item.fillerCount}
+              longPauseCount={item.longPauseCount}
+              wordsPerMinute={item.wordsPerMinute}
+            />
+          </div>
           <Section
             label="Your answer"
             icon={<User className="h-3.5 w-3.5" />}
@@ -113,6 +120,66 @@ export function FeedbackItem({ item }: FeedbackItemProps): ReactElement {
         </div>
       </CollapsibleContent>
     </Collapsible>
+  );
+}
+
+interface DeliveryStripProps {
+  fillerCount: number;
+  longPauseCount: number;
+  wordsPerMinute: number;
+}
+
+function DeliveryStrip({ fillerCount, longPauseCount, wordsPerMinute }: DeliveryStripProps): ReactElement {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        Delivery
+      </span>
+      <Chip
+        icon={<Wind className="h-3.5 w-3.5" />}
+        label="Filler words"
+        value={String(fillerCount)}
+        tone={fillerCount === 0 ? "good" : fillerCount <= 3 ? "neutral" : "warn"}
+      />
+      <Chip
+        icon={<PauseCircle className="h-3.5 w-3.5" />}
+        label="Long pauses"
+        value={String(longPauseCount)}
+        tone={longPauseCount === 0 ? "good" : longPauseCount <= 2 ? "neutral" : "warn"}
+      />
+      <Chip
+        icon={<Gauge className="h-3.5 w-3.5" />}
+        label="Words / min"
+        value={wordsPerMinute > 0 ? String(wordsPerMinute) : "—"}
+        tone="neutral"
+      />
+    </div>
+  );
+}
+
+interface ChipProps {
+  icon: ReactElement;
+  label: string;
+  value: string;
+  tone: "good" | "neutral" | "warn";
+}
+
+function Chip({ icon, label, value, tone }: ChipProps): ReactElement {
+  const toneClass = cn(
+    "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
+    tone === "good" &&
+      "bg-emerald-50 text-emerald-700 ring-emerald-200 dark:bg-emerald-500/10 dark:text-emerald-300 dark:ring-emerald-500/30",
+    tone === "neutral" &&
+      "bg-secondary text-foreground ring-border",
+    tone === "warn" &&
+      "bg-amber-50 text-amber-800 ring-amber-200 dark:bg-amber-500/10 dark:text-amber-300 dark:ring-amber-500/30",
+  );
+  return (
+    <span className={toneClass}>
+      {icon}
+      <span className="text-muted-foreground">{label}</span>
+      <span className="tabular-nums font-semibold">{value}</span>
+    </span>
   );
 }
 
