@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,26 +13,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// updateEmbeddingCall captures one invocation of UpdateAnswerEmbedding so
+// tests can assert that the background embed goroutine actually fired.
+type updateEmbeddingCall struct {
+	mockID        string
+	clerkUserID   string
+	questionIndex int
+	vec           []float32
+}
+
 // fakeStore captures call args + lets each method's behaviour be overridden
 // per test via *Func fields. Empty defaults are happy path.
 type fakeStore struct {
-	upsertCalls           []string
-	createInterviewCalls  []domain.MockInterview
-	upsertAnswerCalls     []domain.UserAnswer
-	setResumeCalls        []string
-	insertCoachReportCalls []domain.CoachReport
+	mu                       sync.Mutex // guards slices written from background goroutines
+	upsertCalls              []string
+	createInterviewCalls     []domain.MockInterview
+	upsertAnswerCalls        []domain.UserAnswer
+	setResumeCalls           []string
+	insertCoachReportCalls   []domain.CoachReport
+	updateEmbeddingCalls     []updateEmbeddingCall
 
-	upsertUserFunc             func(ctx context.Context, userID string) error
-	setUserResumeFunc          func(ctx context.Context, userID, resumeText string) error
-	getUserResumeFunc          func(ctx context.Context, userID string) (string, time.Time, error)
-	clearUserResumeFunc        func(ctx context.Context, userID string) error
-	createInterviewFunc        func(ctx context.Context, m domain.MockInterview) error
-	listInterviewsByUserFunc   func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
-	getInterviewByMockIDFunc   func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
-	upsertAnswerFunc           func(ctx context.Context, a domain.UserAnswer) error
-	listAnswersByMockIDFunc    func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
-	insertCoachReportFunc      func(ctx context.Context, cr domain.CoachReport) error
-	getCoachReportByMockIDFunc func(ctx context.Context, mockID, userID string) (domain.CoachReport, error)
+	upsertUserFunc                 func(ctx context.Context, userID string) error
+	setUserResumeFunc              func(ctx context.Context, userID, resumeText string) error
+	getUserResumeFunc              func(ctx context.Context, userID string) (string, time.Time, error)
+	clearUserResumeFunc            func(ctx context.Context, userID string) error
+	createInterviewFunc            func(ctx context.Context, m domain.MockInterview) error
+	listInterviewsByUserFunc       func(ctx context.Context, userID string, limit int) ([]domain.InterviewSummary, error)
+	getInterviewByMockIDFunc       func(ctx context.Context, mockID, userID string) (domain.MockInterview, error)
+	upsertAnswerFunc               func(ctx context.Context, a domain.UserAnswer) error
+	listAnswersByMockIDFunc        func(ctx context.Context, mockID, userID string) ([]domain.UserAnswer, error)
+	insertCoachReportFunc          func(ctx context.Context, cr domain.CoachReport) error
+	getCoachReportByMockIDFunc     func(ctx context.Context, mockID, userID string) (domain.CoachReport, error)
+	updateAnswerEmbeddingFunc      func(ctx context.Context, mockID, userID string, questionIndex int, vec []float32) error
+	findSimilarWeakAnswersFunc     func(ctx context.Context, userID string, queryVec []float32, ratingThreshold, limit int) ([]domain.WeakAnswerHit, error)
+	listUserInterviewSummariesFunc func(ctx context.Context, userID string, limit int) ([]domain.PastInterviewSummary, error)
 }
 
 func (f *fakeStore) SetUserResume(ctx context.Context, userID, resumeText string) error {
@@ -116,6 +131,41 @@ func (f *fakeStore) GetCoachReportByMockID(ctx context.Context, mockID, userID s
 	return domain.CoachReport{}, domain.ErrNotFound
 }
 
+func (f *fakeStore) UpdateAnswerEmbedding(ctx context.Context, mockID, userID string, questionIndex int, vec []float32) error {
+	f.mu.Lock()
+	f.updateEmbeddingCalls = append(f.updateEmbeddingCalls, updateEmbeddingCall{
+		mockID:        mockID,
+		clerkUserID:   userID,
+		questionIndex: questionIndex,
+		vec:           vec,
+	})
+	f.mu.Unlock()
+	if f.updateAnswerEmbeddingFunc != nil {
+		return f.updateAnswerEmbeddingFunc(ctx, mockID, userID, questionIndex, vec)
+	}
+	return nil
+}
+
+func (f *fakeStore) embedCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.updateEmbeddingCalls)
+}
+
+func (f *fakeStore) FindSimilarWeakAnswers(ctx context.Context, userID string, queryVec []float32, ratingThreshold, limit int) ([]domain.WeakAnswerHit, error) {
+	if f.findSimilarWeakAnswersFunc != nil {
+		return f.findSimilarWeakAnswersFunc(ctx, userID, queryVec, ratingThreshold, limit)
+	}
+	return nil, nil
+}
+
+func (f *fakeStore) ListUserInterviewSummaries(ctx context.Context, userID string, limit int) ([]domain.PastInterviewSummary, error) {
+	if f.listUserInterviewSummariesFunc != nil {
+		return f.listUserInterviewSummariesFunc(ctx, userID, limit)
+	}
+	return nil, nil
+}
+
 type fakeLLM struct {
 	model                         string
 	generateQuestionsFunc         func(ctx context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error)
@@ -125,6 +175,16 @@ type fakeLLM struct {
 	judgeFollowUpFunc             func(ctx context.Context, in domain.FollowUpSeed) (string, error)
 	generateCoachReportFunc       func(ctx context.Context, in domain.CoachReportSeed) (string, int, error)
 	generateCoachReportStreamFunc func(ctx context.Context, in domain.CoachReportSeed, onChunk func(string) error) (int, error)
+	embedFunc                     func(ctx context.Context, text string) ([]float32, error)
+}
+
+func (f *fakeLLM) Embed(ctx context.Context, text string) ([]float32, error) {
+	if f.embedFunc != nil {
+		return f.embedFunc(ctx, text)
+	}
+	// Default: a deterministic small vector so tests that don't care about
+	// the exact bytes still get a valid response shape.
+	return []float32{0.1, 0.2, 0.3}, nil
 }
 
 func (f *fakeLLM) Model() string {
@@ -1025,6 +1085,199 @@ func TestGetCoachReport_HappyPath(t *testing.T) {
 	got, err := svc.GetCoachReport(context.Background(), "user_1", "mock-123")
 	require.NoError(t, err)
 	require.Equal(t, want, got)
+}
+
+// --- SubmitAnswer background embedding ---
+
+func TestSubmitAnswer_LaunchesBackgroundEmbed_OnHappyPath(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, userID string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{
+				sampleAnswer(mockID, 0, 7),
+			}, nil
+		},
+	}
+	var embedCalled string
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, text string) ([]float32, error) {
+			embedCalled = text
+			return []float32{0.5, 0.6, 0.7}, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		UserAnswer:    "my answer about goroutines and channels",
+	})
+	require.NoError(t, err)
+
+	// Background goroutine fires-and-forgets: poll until it lands.
+	require.Eventually(t, func() bool {
+		return store.embedCallCount() == 1 && embedCalled != ""
+	}, time.Second, 5*time.Millisecond)
+
+	// Embedded text combines the question text and the user's answer so
+	// the vector captures both sides of the topic surface.
+	require.Contains(t, embedCalled, "my answer about goroutines and channels")
+
+	store.mu.Lock()
+	call := store.updateEmbeddingCalls[0]
+	store.mu.Unlock()
+	require.Equal(t, "mock-123", call.mockID)
+	require.Equal(t, "user_1", call.clerkUserID)
+	require.Equal(t, 0, call.questionIndex)
+	require.Equal(t, []float32{0.5, 0.6, 0.7}, call.vec)
+}
+
+func TestSubmitAnswer_EmbeddingFailure_DoesNotAffectResponse(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listAnswersByMockIDFunc: func(_ context.Context, mockID, userID string) ([]domain.UserAnswer, error) {
+			return []domain.UserAnswer{sampleAnswer(mockID, 0, 7)}, nil
+		},
+	}
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, _ string) ([]float32, error) {
+			return nil, fmt.Errorf("upstream embed failure: %w", domain.ErrLLM)
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	answer, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		UserAnswer:    "an answer",
+	})
+	require.NoError(t, err, "embed failure must not surface in the response")
+	require.Equal(t, 0, answer.QuestionIndex)
+
+	// Give the goroutine time to do its (failing) work, then assert no
+	// embedding was persisted — the failure was swallowed.
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 0, store.embedCallCount(), "no embedding persisted on LLM failure")
+}
+
+func TestSubmitAnswer_EmbeddingNotCalled_WhenSubmitFails(t *testing.T) {
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+	}
+	var embedCalls int
+	llm := &fakeLLM{
+		evaluateAnswerFunc: func(_ context.Context, _ domain.AnswerSeed) (domain.Evaluation, error) {
+			return domain.Evaluation{}, fmt.Errorf("eval failed: %w", domain.ErrLLM)
+		},
+		embedFunc: func(_ context.Context, _ string) ([]float32, error) {
+			embedCalls++
+			return nil, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.SubmitAnswer(context.Background(), "user_1", SubmitAnswerInput{
+		MockID:        "mock-123",
+		QuestionIndex: 0,
+		UserAnswer:    "x",
+	})
+	require.Error(t, err)
+
+	time.Sleep(20 * time.Millisecond) // give any rogue goroutine a chance to fire
+	require.Equal(t, 0, embedCalls, "embedding must NOT be attempted when submit fails")
+	require.Equal(t, 0, store.embedCallCount())
+}
+
+// --- Coach report enrichment ---
+
+func TestBuildCoachReportSeed_EnrichesWithHistoryAndFiltersCurrentInterview(t *testing.T) {
+	mi := sampleInterview("user_1")
+	answers := []domain.UserAnswer{sampleAnswer(mi.MockID, 0, 7)}
+
+	history := []domain.PastInterviewSummary{
+		{MockID: mi.MockID, JobPosition: "Backend Engineer", AvgRating: 7.0, AnsweredCount: 1, CreatedAt: time.Now()},
+		{MockID: "mock-prev", JobPosition: "Backend Engineer", AvgRating: 6.4, AnsweredCount: 5, CreatedAt: time.Now().Add(-7 * 24 * time.Hour)},
+	}
+	weak := []domain.WeakAnswerHit{
+		{MockID: mi.MockID, QuestionText: "current Q", Rating: 4, Feedback: "current weak"},
+		{MockID: "mock-prev", QuestionText: "prior Q", Rating: 5, Feedback: "prior weak"},
+	}
+
+	store := &fakeStore{
+		listUserInterviewSummariesFunc: func(_ context.Context, userID string, limit int) ([]domain.PastInterviewSummary, error) {
+			require.Equal(t, "user_1", userID)
+			require.Equal(t, coachHistoryLimit, limit)
+			return history, nil
+		},
+		findSimilarWeakAnswersFunc: func(_ context.Context, userID string, vec []float32, threshold, limit int) ([]domain.WeakAnswerHit, error) {
+			require.Equal(t, "user_1", userID)
+			require.NotEmpty(t, vec)
+			require.Equal(t, coachWeakRatingMax, threshold)
+			require.Equal(t, coachWeakHitsLimit, limit)
+			return weak, nil
+		},
+	}
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, text string) ([]float32, error) {
+			require.Contains(t, text, mi.JobPosition, "role embed should include the job position surface")
+			return []float32{0.1, 0.2, 0.3}, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	seed := svc.buildCoachReportSeed(context.Background(), mi, answers)
+	require.Equal(t, history, seed.PastInterviews)
+	// Current interview's weak hit is filtered out — only the prior one
+	// survives because the LLM is about to re-narrate the current.
+	require.Len(t, seed.RecurringWeak, 1)
+	require.Equal(t, "mock-prev", seed.RecurringWeak[0].MockID)
+}
+
+func TestBuildCoachReportSeed_FirstTimeUser_NoEnrichment(t *testing.T) {
+	mi := sampleInterview("user_1")
+	answers := []domain.UserAnswer{sampleAnswer(mi.MockID, 0, 7)}
+
+	// Default fakeStore returns nil for both history and weak hits.
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+
+	seed := svc.buildCoachReportSeed(context.Background(), mi, answers)
+	require.Empty(t, seed.PastInterviews)
+	require.Empty(t, seed.RecurringWeak)
+	// Basic fields still populated — enrichment is purely additive.
+	require.Equal(t, mi.JobPosition, seed.JobPosition)
+	require.Equal(t, answers, seed.Answers)
+}
+
+func TestBuildCoachReportSeed_EmbedFailure_StillReturnsHistory(t *testing.T) {
+	mi := sampleInterview("user_1")
+	history := []domain.PastInterviewSummary{
+		{MockID: "mock-prev", JobPosition: "Backend Engineer", AvgRating: 6.0, AnsweredCount: 5, CreatedAt: time.Now()},
+	}
+	store := &fakeStore{
+		listUserInterviewSummariesFunc: func(_ context.Context, _ string, _ int) ([]domain.PastInterviewSummary, error) {
+			return history, nil
+		},
+		findSimilarWeakAnswersFunc: func(_ context.Context, _ string, _ []float32, _, _ int) ([]domain.WeakAnswerHit, error) {
+			t.Fatal("must not query weak answers when embed failed")
+			return nil, nil
+		},
+	}
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, _ string) ([]float32, error) {
+			return nil, fmt.Errorf("embed down: %w", domain.ErrLLM)
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	seed := svc.buildCoachReportSeed(context.Background(), mi, []domain.UserAnswer{sampleAnswer(mi.MockID, 0, 7)})
+	require.Equal(t, history, seed.PastInterviews)
+	require.Empty(t, seed.RecurringWeak)
 }
 
 // --- StreamCoachReport ---

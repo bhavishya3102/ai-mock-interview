@@ -75,3 +75,29 @@ SELECT cr.mock_id, cr.content, cr.tokens_used, cr.model, cr.created_at
 FROM coach_reports cr
 JOIN mock_interviews mi ON mi.mock_id = cr.mock_id
 WHERE cr.mock_id = $1 AND mi.clerk_user_id = $2;
+
+-- name: UpdateAnswerEmbedding :exec
+UPDATE user_answers
+SET embedding = $4
+WHERE mock_id = $1 AND clerk_user_id = $2 AND question_index = $3;
+
+-- name: FindSimilarWeakAnswers :many
+SELECT mock_id, question_text, user_answer, rating, feedback, created_at
+FROM user_answers
+WHERE clerk_user_id = $1
+  AND embedding IS NOT NULL
+  AND rating < $3
+ORDER BY embedding <-> $2
+LIMIT $4;
+
+-- name: ListUserInterviewSummaries :many
+SELECT mi.mock_id, mi.job_position, mi.created_at,
+       COALESCE(AVG(ua.rating)::numeric(3,1), 0) AS avg_rating,
+       COUNT(ua.id) AS answered_count
+FROM mock_interviews mi
+LEFT JOIN user_answers ua
+       ON ua.mock_id = mi.mock_id AND ua.clerk_user_id = mi.clerk_user_id
+WHERE mi.clerk_user_id = $1
+GROUP BY mi.mock_id, mi.job_position, mi.created_at
+ORDER BY mi.created_at DESC
+LIMIT $2;

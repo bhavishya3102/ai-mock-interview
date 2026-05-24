@@ -13,6 +13,7 @@ evolve, but design decisions are captured here.
 | [`frontend.md`](./frontend.md) | React + Vite SPA: routing map, component breakdown, TanStack Query, Clerk SPA integration, speech/webcam hooks, Tailwind + shadcn/ui, Vitest setup. |
 | [`integration.md`](./integration.md) | Monorepo glue: directory layout, env-var matrix, Neon Postgres setup, golang-migrate workflow, root Makefile, CORS policy, README structure, deployment pointers. |
 | [`coach-report.md`](./coach-report.md) | Post-interview narrative coaching report: new `coach_reports` table, idempotent generation, markdown LLM contract, POST/GET endpoints. Phase 1 = non-streaming; SSE streaming deferred to Phase 2. |
+| [`memory-adaptive.md`](./memory-adaptive.md) | Cross-interview memory via pgvector. MVP slice: embed every new answer, enrich coach reports with longitudinal history + recurring weaknesses. Adaptive difficulty in question generation is a deferred follow-on. |
 
 ## Conventions
 

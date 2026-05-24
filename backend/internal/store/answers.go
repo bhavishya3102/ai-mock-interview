@@ -6,6 +6,7 @@ import (
 
 	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 )
 
 // AnswerRepo persists user_answers.
@@ -54,6 +55,81 @@ func (r *AnswerRepo) UpsertAnswer(ctx context.Context, a domain.UserAnswer) erro
 		return fmt.Errorf("upsert answer: %w", err)
 	}
 	return nil
+}
+
+// UpdateAnswerEmbedding stores the model-produced vector for a previously
+// upserted answer row. Identified by the (mock_id, clerk_user_id,
+// question_index) unique tuple so callers don't need to track the row
+// UUID. Re-running with a different vector is a normal flow when the
+// answer text is re-submitted.
+func (r *AnswerRepo) UpdateAnswerEmbedding(
+	ctx context.Context,
+	mockID string,
+	clerkUserID string,
+	questionIndex int,
+	vec []float32,
+) error {
+	const q = `UPDATE user_answers
+	           SET embedding = $4
+	           WHERE mock_id = $1 AND clerk_user_id = $2 AND question_index = $3`
+	if _, err := r.pool.Exec(ctx, q,
+		mockID, clerkUserID, questionIndex, pgvector.NewVector(vec),
+	); err != nil {
+		return fmt.Errorf("update answer embedding: %w", err)
+	}
+	return nil
+}
+
+// FindSimilarWeakAnswers returns the user's low-rated past answers that
+// are most semantically similar to the supplied query vector. Used to
+// surface recurring weaknesses in the coach report. Rows without an
+// embedding are skipped (their LEFT-JOIN style WHERE clause filters them
+// out implicitly via IS NOT NULL).
+//
+// ratingThreshold is exclusive — only answers with rating < threshold
+// are returned. limit caps the count.
+func (r *AnswerRepo) FindSimilarWeakAnswers(
+	ctx context.Context,
+	clerkUserID string,
+	queryVec []float32,
+	ratingThreshold int,
+	limit int,
+) ([]domain.WeakAnswerHit, error) {
+	const q = `SELECT mock_id, question_text, user_answer, rating, feedback, created_at
+	           FROM user_answers
+	           WHERE clerk_user_id = $1
+	             AND embedding IS NOT NULL
+	             AND rating < $3
+	           ORDER BY embedding <-> $2
+	           LIMIT $4`
+
+	rows, err := r.pool.Query(ctx, q,
+		clerkUserID, pgvector.NewVector(queryVec), ratingThreshold, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find similar weak answers: %w", err)
+	}
+	defer rows.Close()
+
+	out := []domain.WeakAnswerHit{}
+	for rows.Next() {
+		var h domain.WeakAnswerHit
+		if err := rows.Scan(
+			&h.MockID,
+			&h.QuestionText,
+			&h.UserAnswer,
+			&h.Rating,
+			&h.Feedback,
+			&h.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan weak answer row: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate weak answer rows: %w", err)
+	}
+	return out, nil
 }
 
 // ListAnswersByMockID returns the user's answers for an interview, ordered

@@ -104,6 +104,12 @@ func buildCoachReportPrompt(in domain.CoachReportSeed) string {
 		)
 	}
 
+	// Memory enrichment is purely additive: when the user has no prior
+	// interviews and no recurring weak hits the historicalSection and
+	// progressTrackingDirective stay empty and the prompt is byte-identical
+	// to the pre-memory version — no regression risk for first-time users.
+	historicalSection, progressTrackingDirective := buildCoachHistorySections(in)
+
 	return fmt.Sprintf(`You are an experienced interview coach writing a personalised post-interview review for a candidate. You are NOT re-grading the answers — the per-question ratings and feedback are already final and given to you as evidence. Your job is to synthesise them into a single narrative report the candidate can act on.
 
 Candidate context:
@@ -111,8 +117,7 @@ Candidate context:
 - Years of experience: %d
 
 Per-question evidence (already evaluated):
-%s
-Write the report in markdown using EXACTLY these section headings, in this order:
+%s%sWrite the report in markdown using EXACTLY these section headings, in this order:
 
 ## Overall Performance
 One short paragraph naming the candidate's overall level for this role and the 1–2 most important takeaways.
@@ -122,7 +127,7 @@ Bulleted list (2–5 items). Cite specific evidence from the answers above (quot
 
 ### Areas to Improve
 Bulleted list (2–5 items). Cite specific evidence. For each item, say what was missing or wrong and what "good" would look like.
-
+%s
 ### Recommended Next Steps
 Numbered list (3 items). Each item is one concrete action the candidate can take this week — a topic to study, a pattern to practice, a resource type to read (no specific URLs). Tie each step to a weakness named above.
 
@@ -135,7 +140,64 @@ Output the markdown only — no JSON, no code fences around the whole report.`,
 		in.JobPosition,
 		in.YearsExperience,
 		answers.String(),
+		historicalSection,
+		progressTrackingDirective,
 	)
+}
+
+// buildCoachHistorySections renders the optional memory-enrichment blocks
+// of the coach report prompt. Returns two strings:
+//
+//   - historicalSection: a "HISTORICAL CONTEXT" preamble injected before
+//     the report structure instructions. Empty when there is nothing
+//     historical to report.
+//   - progressTrackingDirective: the `### Progress Tracking` instruction
+//     block that slots between Areas to Improve and Recommended Next
+//     Steps. Empty when there is no history (so the report keeps the
+//     original five-section structure).
+//
+// Both strings are empty when the seed has no past interviews AND no
+// recurring weak hits — i.e. for a first-time user. That keeps the
+// pre-memory prompt byte-identical for new users.
+func buildCoachHistorySections(in domain.CoachReportSeed) (string, string) {
+	hasHistory := len(in.PastInterviews) > 1 // current interview counts as 1
+	hasWeak := len(in.RecurringWeak) > 0
+	if !hasHistory && !hasWeak {
+		return "", ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\nHISTORICAL CONTEXT (use this in the Progress Tracking section below):\n")
+
+	if hasHistory {
+		b.WriteString("Past interviews (newest first):\n")
+		for _, h := range in.PastInterviews {
+			fmt.Fprintf(&b, "- %s  %s  avg %.1f/10  (%d answered)\n",
+				h.CreatedAt.Format("2006-01-02"),
+				h.JobPosition,
+				h.AvgRating,
+				h.AnsweredCount,
+			)
+		}
+		b.WriteString("\n")
+	}
+
+	if hasWeak {
+		b.WriteString("Recurring weak answers from prior interviews on topics similar to this role:\n")
+		for _, w := range in.RecurringWeak {
+			fmt.Fprintf(&b, "- %q — got %d/10, feedback: %q\n",
+				w.QuestionText, w.Rating, w.Feedback,
+			)
+		}
+		b.WriteString("\n")
+	}
+
+	directive := `
+### Progress Tracking
+One short paragraph plus optional bullets. Cite specific numerical movement from the past interviews above (e.g. "5.8 → 6.4 → 7.1 on Frontend"), and call out recurring weak topics — if the candidate finally answered one of them well this time, name it as a win. Skip this section entirely if the historical evidence is too thin to draw a trend.
+`
+
+	return b.String(), directive
 }
 
 func buildAnswerEvalPrompt(in domain.AnswerSeed) string {

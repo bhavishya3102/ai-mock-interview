@@ -68,3 +68,27 @@ type TranscriptResult struct {
 	Transcript string         `json:"transcript"`
 	Analysis   SpeechAnalysis `json:"analysis"`
 }
+
+// PastInterviewSummary is one row of a user's interview history. Used by
+// the coach report to surface trend lines ("3rd Frontend interview, avg
+// rising 5.8 → 6.4 → 7.1"). Computed via JOIN — no separate aggregate
+// table is maintained.
+type PastInterviewSummary struct {
+	MockID        string    `json:"mockId"`
+	JobPosition   string    `json:"jobPosition"`
+	AvgRating     float64   `json:"avgRating"`
+	AnsweredCount int       `json:"answeredCount"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// WeakAnswerHit is a low-scoring past answer that is semantically close
+// to the current interview's role. The coach report uses these to point
+// out recurring weaknesses without making the user re-explain context.
+type WeakAnswerHit struct {
+	MockID       string    `json:"mockId"`
+	QuestionText string    `json:"questionText"`
+	UserAnswer   string    `json:"userAnswer"`
+	Rating       int       `json:"rating"`
+	Feedback     string    `json:"feedback"`
+	CreatedAt    time.Time `json:"createdAt"`
+}

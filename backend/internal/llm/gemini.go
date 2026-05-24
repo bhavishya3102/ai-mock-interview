@@ -42,6 +42,42 @@ func NewClient(ctx context.Context, apiKey, model string) (*Client, error) {
 // model version that produced them.
 func (c *Client) Model() string { return c.model }
 
+// embeddingModel is the Gemini text-embedding model used by Embed below.
+// Pinned here rather than in config because the database column dimension
+// (vector(768)) is coupled to this exact model; changing the model
+// without a migration would corrupt the index.
+const embeddingModel = "models/text-embedding-004"
+
+// Embed turns text into a 768-dimensional vector via Gemini's
+// text-embedding-004 model. Empty input returns an empty slice and no
+// error — the caller can decide whether that is a problem (usually it
+// means there is nothing meaningful to index).
+//
+// Errors are wrapped with ErrLLM so the caller can errors.Is() the
+// failure class without caring about the underlying SDK error type.
+func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
+	if text == "" {
+		return nil, nil
+	}
+	resp, err := c.sdk.Models.EmbedContent(
+		ctx,
+		embeddingModel,
+		genai.Text(text),
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("gemini embed: %w", errors.Join(domain.ErrLLM, err))
+	}
+	if len(resp.Embeddings) == 0 || resp.Embeddings[0] == nil {
+		return nil, fmt.Errorf("gemini embed: empty response: %w", domain.ErrLLM)
+	}
+	values := resp.Embeddings[0].Values
+	if len(values) == 0 {
+		return nil, fmt.Errorf("gemini embed: empty vector: %w", domain.ErrLLM)
+	}
+	return values, nil
+}
+
 // GenerateQuestions asks the model for QuestionCount question/answer pairs.
 // The response is structured JSON validated by questionGenSchema, so we can
 // json.Unmarshal directly without string-mutation hacks.

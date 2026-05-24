@@ -153,6 +153,55 @@ func (r *InterviewRepo) ListInterviewsByUser(
 	return out, nil
 }
 
+// ListUserInterviewSummaries returns a roll-up of the user's past
+// interviews — one row per mock_id with the average rating across its
+// answers. Pure SQL, no embeddings involved, so it works for every user
+// regardless of whether their answers have been embedded yet.
+//
+// Ordered newest-first. limit caps the count (callers pass 5 for the
+// coach-report trend window).
+func (r *InterviewRepo) ListUserInterviewSummaries(
+	ctx context.Context,
+	clerkUserID string,
+	limit int,
+) ([]domain.PastInterviewSummary, error) {
+	const q = `SELECT mi.mock_id, mi.job_position, mi.created_at,
+	                  COALESCE(AVG(ua.rating)::numeric(3,1), 0) AS avg_rating,
+	                  COUNT(ua.id) AS answered_count
+	           FROM mock_interviews mi
+	           LEFT JOIN user_answers ua
+	                  ON ua.mock_id = mi.mock_id AND ua.clerk_user_id = mi.clerk_user_id
+	           WHERE mi.clerk_user_id = $1
+	           GROUP BY mi.mock_id, mi.job_position, mi.created_at
+	           ORDER BY mi.created_at DESC
+	           LIMIT $2`
+
+	rows, err := r.pool.Query(ctx, q, clerkUserID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list interview summaries: %w", err)
+	}
+	defer rows.Close()
+
+	out := []domain.PastInterviewSummary{}
+	for rows.Next() {
+		var s domain.PastInterviewSummary
+		if err := rows.Scan(
+			&s.MockID,
+			&s.JobPosition,
+			&s.CreatedAt,
+			&s.AvgRating,
+			&s.AnsweredCount,
+		); err != nil {
+			return nil, fmt.Errorf("scan interview summary row: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate interview summary rows: %w", err)
+	}
+	return out, nil
+}
+
 // GetInterviewByMockID fetches one interview owned by clerkUserID. Ownership
 // is enforced in the WHERE clause — a not-owned row returns ErrNotFound, the
 // same as missing, so we never leak existence.

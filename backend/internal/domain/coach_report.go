@@ -17,8 +17,16 @@ type CoachReport struct {
 // CoachReportSeed is the input the LLM uses to draft the report. Answers
 // are the already-evaluated per-question rows (rating, feedback, speech
 // metrics) so the LLM does not re-grade — it only narrates.
+//
+// PastInterviews and RecurringWeak are optional enrichment populated by
+// the service from the user's interview history. When both are empty
+// (first-time user, or enrichment failed) the prompt builder skips the
+// "Progress Tracking" section and the report is byte-identical to the
+// non-memory variant — no regression risk for new users.
 type CoachReportSeed struct {
 	JobPosition     string
 	YearsExperience int
 	Answers         []UserAnswer
+	PastInterviews  []PastInterviewSummary
+	RecurringWeak   []WeakAnswerHit
 }

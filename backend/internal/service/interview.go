@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -29,6 +30,9 @@ type Store interface {
 	ListAnswersByMockID(ctx context.Context, mockID, clerkUserID string) ([]domain.UserAnswer, error)
 	InsertCoachReport(ctx context.Context, cr domain.CoachReport) error
 	GetCoachReportByMockID(ctx context.Context, mockID, clerkUserID string) (domain.CoachReport, error)
+	UpdateAnswerEmbedding(ctx context.Context, mockID, clerkUserID string, questionIndex int, vec []float32) error
+	FindSimilarWeakAnswers(ctx context.Context, clerkUserID string, queryVec []float32, ratingThreshold, limit int) ([]domain.WeakAnswerHit, error)
+	ListUserInterviewSummaries(ctx context.Context, clerkUserID string, limit int) ([]domain.PastInterviewSummary, error)
 }
 
 // LLMClient is the LLM interface required by InterviewService.
@@ -40,6 +44,7 @@ type LLMClient interface {
 	JudgeFollowUp(ctx context.Context, in domain.FollowUpSeed) (string, error)
 	GenerateCoachReport(ctx context.Context, in domain.CoachReportSeed) (content string, tokensUsed int, err error)
 	GenerateCoachReportStream(ctx context.Context, in domain.CoachReportSeed, onChunk func(text string) error) (tokensUsed int, err error)
+	Embed(ctx context.Context, text string) ([]float32, error)
 	Model() string
 }
 
@@ -259,6 +264,11 @@ func (s *InterviewService) SubmitAnswer(
 	}
 	for _, x := range saved {
 		if x.QuestionIndex == in.QuestionIndex {
+			// Fire-and-forget: compute and store the vector embedding so
+			// the answer participates in future memory queries. Failures
+			// are logged and dropped — we never block or fail the
+			// already-committed submit on an enrichment miss.
+			go s.embedAnswerAsync(ctx, mi.MockID, clerkUserID, in.QuestionIndex, qa.Question, in.UserAnswer)
 			return x, nil
 		}
 	}
@@ -266,6 +276,52 @@ func (s *InterviewService) SubmitAnswer(
 	// fundamentally wrong with the connection — surface as a server fault,
 	// not silently succeed.
 	return domain.UserAnswer{}, errors.New("submit answer: upserted row missing from readback")
+}
+
+// embedAnswerAsync runs the embedding round-trip and store update in the
+// background. Detaches from the request context (which dies the moment
+// the HTTP response is sent) via context.WithoutCancel, then imposes its
+// own 30s deadline so a hung upstream cannot leak goroutines forever.
+//
+// All failures are warn-level: the answer is already persisted and the
+// user has their evaluation — a missing vector only degrades future
+// memory-enriched coach reports, never the current flow.
+func (s *InterviewService) embedAnswerAsync(
+	requestCtx context.Context,
+	mockID string,
+	clerkUserID string,
+	questionIndex int,
+	questionText string,
+	userAnswerText string,
+) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), 30*time.Second)
+	defer cancel()
+
+	text := strings.TrimSpace(questionText + " " + userAnswerText)
+	if text == "" {
+		return
+	}
+
+	vec, err := s.llm.Embed(ctx, text)
+	if err != nil {
+		slog.WarnContext(ctx, "embed answer failed",
+			slog.String("mock_id", mockID),
+			slog.Int("question_index", questionIndex),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if len(vec) == 0 {
+		return
+	}
+
+	if err := s.store.UpdateAnswerEmbedding(ctx, mockID, clerkUserID, questionIndex, vec); err != nil {
+		slog.WarnContext(ctx, "store answer embedding failed",
+			slog.String("mock_id", mockID),
+			slog.Int("question_index", questionIndex),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // UploadResume extracts text from the candidate's resume PDF via the LLM and
@@ -434,6 +490,79 @@ func (s *InterviewService) TranscribeAudio(
 	return result, nil
 }
 
+// Coach-report enrichment knobs. Pulled out as constants because the
+// prompt explicitly references "last N interviews" / "5 recurring weak
+// areas" — both numbers need to stay in sync with prompts.go.
+const (
+	coachHistoryLimit  = 5
+	coachWeakRatingMax = 6
+	coachWeakHitsLimit = 5
+)
+
+// buildCoachReportSeed assembles the LLM seed for a coach report,
+// including best-effort enrichment with cross-interview history and
+// recurring weaknesses surfaced via vector similarity. Any enrichment
+// failure (DB or LLM) is logged at warn level and dropped — the report
+// still generates with the basic seed, so a missing index or an
+// embedding hiccup never blocks the user-facing flow.
+func (s *InterviewService) buildCoachReportSeed(
+	ctx context.Context,
+	mi domain.MockInterview,
+	answers []domain.UserAnswer,
+) domain.CoachReportSeed {
+	seed := domain.CoachReportSeed{
+		JobPosition:     mi.JobPosition,
+		YearsExperience: mi.YearsExperience,
+		Answers:         answers,
+	}
+
+	history, err := s.store.ListUserInterviewSummaries(ctx, mi.ClerkUserID, coachHistoryLimit)
+	if err != nil {
+		slog.WarnContext(ctx, "coach report: history fetch failed",
+			slog.String("mock_id", mi.MockID),
+			slog.String("error", err.Error()),
+		)
+	} else {
+		seed.PastInterviews = history
+	}
+
+	// One embed for the role surface; if it fails we skip the semantic
+	// search entirely (no point querying with a zero vector).
+	queryVec, err := s.llm.Embed(ctx, mi.JobPosition+" "+mi.JobDescription)
+	if err != nil {
+		slog.WarnContext(ctx, "coach report: role embed failed",
+			slog.String("mock_id", mi.MockID),
+			slog.String("error", err.Error()),
+		)
+		return seed
+	}
+	if len(queryVec) == 0 {
+		return seed
+	}
+
+	weak, err := s.store.FindSimilarWeakAnswers(ctx, mi.ClerkUserID, queryVec, coachWeakRatingMax, coachWeakHitsLimit)
+	if err != nil {
+		slog.WarnContext(ctx, "coach report: weak answer search failed",
+			slog.String("mock_id", mi.MockID),
+			slog.String("error", err.Error()),
+		)
+		return seed
+	}
+
+	// Drop hits from the CURRENT interview: those answers are already in
+	// seed.Answers and the LLM is about to narrate them in the main body.
+	// The Progress Tracking section is specifically about PRIOR sessions.
+	filtered := make([]domain.WeakAnswerHit, 0, len(weak))
+	for _, h := range weak {
+		if h.MockID != mi.MockID {
+			filtered = append(filtered, h)
+		}
+	}
+	seed.RecurringWeak = filtered
+
+	return seed
+}
+
 // GenerateCoachReport produces (or returns the cached) narrative coaching
 // report for a finished interview. The operation is idempotent: if a report
 // already exists for mockID we return it without re-calling the LLM, so a
@@ -483,11 +612,7 @@ func (s *InterviewService) GenerateCoachReport(
 		return domain.CoachReport{}, fmt.Errorf("generate coach report: no answers submitted: %w", domain.ErrValidation)
 	}
 
-	content, tokens, err := s.llm.GenerateCoachReport(ctx, domain.CoachReportSeed{
-		JobPosition:     mi.JobPosition,
-		YearsExperience: mi.YearsExperience,
-		Answers:         answers,
-	})
+	content, tokens, err := s.llm.GenerateCoachReport(ctx, s.buildCoachReportSeed(ctx, mi, answers))
 	if err != nil {
 		return domain.CoachReport{}, fmt.Errorf("generate coach report: %w", err)
 	}
@@ -578,11 +703,7 @@ func (s *InterviewService) StreamCoachReport(
 	var buf strings.Builder
 	tokens, err := s.llm.GenerateCoachReportStream(
 		ctx,
-		domain.CoachReportSeed{
-			JobPosition:     mi.JobPosition,
-			YearsExperience: mi.YearsExperience,
-			Answers:         answers,
-		},
+		s.buildCoachReportSeed(ctx, mi, answers),
 		func(chunk string) error {
 			buf.WriteString(chunk)
 			return onChunk(chunk)

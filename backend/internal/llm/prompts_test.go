@@ -3,6 +3,7 @@ package llm
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bhavishya3102/ai-mock-interview/backend/internal/domain"
 	"github.com/stretchr/testify/require"
@@ -126,4 +127,90 @@ func TestBuildCoachReportPrompt_HandlesSingleAnswer(t *testing.T) {
 	require.Contains(t, p, "window function")
 	require.NotContains(t, p, "%!s") // no fmt formatting leaks
 	require.NotContains(t, p, "%!d")
+}
+
+func TestBuildCoachReportPrompt_FirstTimeUser_NoHistoricalSection(t *testing.T) {
+	// First-time user (no enrichment): prompt must NOT include the
+	// historical-context preamble or the Progress Tracking directive.
+	p := buildCoachReportPrompt(domain.CoachReportSeed{
+		JobPosition:     "Backend Engineer",
+		YearsExperience: 2,
+		Answers:         []domain.UserAnswer{{QuestionIndex: 0, QuestionText: "Q", UserAnswer: "A", Rating: 7, Feedback: "ok"}},
+		// PastInterviews + RecurringWeak both nil.
+	})
+	require.NotContains(t, p, "HISTORICAL CONTEXT")
+	require.NotContains(t, p, "Progress Tracking")
+}
+
+func TestBuildCoachReportPrompt_ReturningUser_IncludesHistoryAndProgressDirective(t *testing.T) {
+	// Past interviews list has TWO entries (one being the current
+	// interview); historical-section logic triggers only when there are
+	// more than just the current attempt.
+	past := []domain.PastInterviewSummary{
+		{
+			MockID: "mock-current", JobPosition: "Backend Engineer",
+			AvgRating: 7.1, AnsweredCount: 5,
+			CreatedAt: mustParse("2026-05-10T10:00:00Z"),
+		},
+		{
+			MockID: "mock-mar", JobPosition: "Backend Engineer",
+			AvgRating: 5.8, AnsweredCount: 5,
+			CreatedAt: mustParse("2026-03-12T10:00:00Z"),
+		},
+	}
+	weak := []domain.WeakAnswerHit{
+		{
+			MockID: "mock-mar", QuestionText: "Explain MVCC",
+			Rating: 4, Feedback: "no mention of vacuum",
+		},
+	}
+
+	p := buildCoachReportPrompt(domain.CoachReportSeed{
+		JobPosition:     "Backend Engineer",
+		YearsExperience: 4,
+		Answers:         []domain.UserAnswer{{QuestionIndex: 0, QuestionText: "Q", UserAnswer: "A", Rating: 7, Feedback: "ok"}},
+		PastInterviews:  past,
+		RecurringWeak:   weak,
+	})
+
+	// Historical preamble + both past dates surfaced for the LLM to cite.
+	require.Contains(t, p, "HISTORICAL CONTEXT")
+	require.Contains(t, p, "2026-05-10")
+	require.Contains(t, p, "2026-03-12")
+	require.Contains(t, p, "5.8") // historical avg shows up
+	// Recurring weak evidence — verbatim quote so the LLM can paraphrase
+	// without inventing details.
+	require.Contains(t, p, "Explain MVCC")
+	require.Contains(t, p, "no mention of vacuum")
+	// Progress Tracking section instruction is injected between Areas to
+	// Improve and Recommended Next Steps.
+	require.Contains(t, p, "### Progress Tracking")
+	areasIdx := strings.Index(p, "### Areas to Improve")
+	progressIdx := strings.Index(p, "### Progress Tracking")
+	nextStepsIdx := strings.Index(p, "### Recommended Next Steps")
+	require.Greater(t, progressIdx, areasIdx, "Progress Tracking should follow Areas to Improve")
+	require.Greater(t, nextStepsIdx, progressIdx, "Recommended Next Steps should follow Progress Tracking")
+}
+
+func TestBuildCoachReportPrompt_OnlyCurrentInterviewInHistory_NoProgressSection(t *testing.T) {
+	// Edge: history contains exactly one row (the current interview).
+	// That's not enough context to draw a trend — skip enrichment.
+	p := buildCoachReportPrompt(domain.CoachReportSeed{
+		JobPosition: "Frontend Engineer",
+		Answers:     []domain.UserAnswer{{QuestionIndex: 0, QuestionText: "Q", UserAnswer: "A", Rating: 7, Feedback: "ok"}},
+		PastInterviews: []domain.PastInterviewSummary{
+			{MockID: "current", JobPosition: "Frontend Engineer", AvgRating: 7.0, AnsweredCount: 1, CreatedAt: mustParse("2026-05-10T10:00:00Z")},
+		},
+		// RecurringWeak intentionally empty.
+	})
+	require.NotContains(t, p, "HISTORICAL CONTEXT")
+	require.NotContains(t, p, "Progress Tracking")
+}
+
+func mustParse(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return t
 }
