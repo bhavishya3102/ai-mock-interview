@@ -124,12 +124,7 @@ func (s *InterviewService) CreateInterview(
 		return domain.MockInterview{}, fmt.Errorf("create interview: %w", err)
 	}
 
-	questions, err := s.llm.GenerateQuestions(ctx, domain.InterviewSeed{
-		JobPosition:     in.JobPosition,
-		JobDescription:  in.JobDescription,
-		YearsExperience: in.YearsExperience,
-		ResumeText:      resumeText,
-	})
+	questions, err := s.llm.GenerateQuestions(ctx, s.buildInterviewSeed(ctx, in, clerkUserID, resumeText))
 	if err != nil {
 		return domain.MockInterview{}, fmt.Errorf("create interview: %w", err)
 	}
@@ -490,14 +485,76 @@ func (s *InterviewService) TranscribeAudio(
 	return result, nil
 }
 
-// Coach-report enrichment knobs. Pulled out as constants because the
-// prompt explicitly references "last N interviews" / "5 recurring weak
-// areas" — both numbers need to stay in sync with prompts.go.
+// Memory-enrichment knobs shared by the coach report and adaptive
+// question generation. Pulled out as constants because the prompts
+// explicitly reference "last N interviews" / "5 recurring weak areas"
+// — both numbers need to stay in sync with prompts.go.
+//
+// (The `coach` prefix is historical — these constants were introduced
+// for the coach-report enrichment first. Adaptive difficulty reuses
+// the same values to keep memory behaviour consistent across flows.)
 const (
 	coachHistoryLimit  = 5
 	coachWeakRatingMax = 6
 	coachWeakHitsLimit = 5
 )
+
+// buildInterviewSeed assembles the LLM seed for question generation,
+// including best-effort adaptive enrichment with the candidate's
+// interview history and recurring weak topics. Mirrors
+// buildCoachReportSeed but used at interview *creation* time, before
+// any answers exist for the current mock.
+//
+// Any enrichment failure (DB or LLM) is logged at warn level and
+// dropped — question generation still runs with whatever was gathered,
+// so a missing index or an embedding hiccup never blocks the create
+// flow.
+func (s *InterviewService) buildInterviewSeed(
+	ctx context.Context,
+	in CreateInterviewInput,
+	clerkUserID string,
+	resumeText string,
+) domain.InterviewSeed {
+	seed := domain.InterviewSeed{
+		JobPosition:     in.JobPosition,
+		JobDescription:  in.JobDescription,
+		YearsExperience: in.YearsExperience,
+		ResumeText:      resumeText,
+	}
+
+	history, err := s.store.ListUserInterviewSummaries(ctx, clerkUserID, coachHistoryLimit)
+	if err != nil {
+		slog.WarnContext(ctx, "create interview: history fetch failed",
+			slog.String("error", err.Error()),
+		)
+	} else {
+		seed.PastInterviews = history
+	}
+
+	// One embed for the role surface; if it fails we skip the semantic
+	// search (no point querying with a zero vector).
+	queryVec, err := s.llm.Embed(ctx, in.JobPosition+" "+in.JobDescription)
+	if err != nil {
+		slog.WarnContext(ctx, "create interview: role embed failed",
+			slog.String("error", err.Error()),
+		)
+		return seed
+	}
+	if len(queryVec) == 0 {
+		return seed
+	}
+
+	weak, err := s.store.FindSimilarWeakAnswers(ctx, clerkUserID, queryVec, coachWeakRatingMax, coachWeakHitsLimit)
+	if err != nil {
+		slog.WarnContext(ctx, "create interview: weak answer search failed",
+			slog.String("error", err.Error()),
+		)
+		return seed
+	}
+	seed.WeakAreas = weak
+
+	return seed
+}
 
 // buildCoachReportSeed assembles the LLM seed for a coach report,
 // including best-effort enrichment with cross-interview history and

@@ -28,6 +28,12 @@ Candidate's resume:
 		resumeConstraint = "\n- At least 2 questions MUST reference specific, concrete details from the candidate's resume (a named project, employer, technology, or claim) — e.g. \"You wrote that you led a database migration at X — walk me through it.\" Quote or paraphrase the resume detail so the candidate knows exactly what you mean. Do not invent details that are not in the resume."
 	}
 
+	// Adaptive enrichment is purely additive: when the candidate has no
+	// past interviews and no recorded weak hits the directive stays empty
+	// and the prompt is byte-identical to the pre-adaptive version — no
+	// regression risk for first-time users.
+	adaptiveDirective := buildAdaptiveDirective(in)
+
 	return fmt.Sprintf(`You are an experienced technical interviewer.
 
 Generate exactly %d distinct interview questions and their model answers for the following candidate context. Questions must be open-ended (no yes/no questions), ordered from easier to harder, and tightly scoped to the role and experience level.
@@ -36,7 +42,7 @@ Job position: %s
 Years of experience: %d
 Job description:
 %s
-%s
+%s%s
 Constraints:
 - Each question must be answerable verbally in 2–4 minutes by a competent candidate.
 - The "answer" field must be a strong reference answer the interviewer would consider excellent.
@@ -47,8 +53,53 @@ Constraints:
 		in.YearsExperience,
 		in.JobDescription,
 		resumeSection,
+		adaptiveDirective,
 		resumeConstraint,
 	)
+}
+
+// buildAdaptiveDirective renders the optional ADAPTIVE DIFFICULTY
+// DIRECTIVE block for buildQuestionPrompt. Returns the empty string
+// when the seed has no past interviews and no weak hits — i.e. for a
+// first-time user — so the rest of the prompt stays byte-identical to
+// the pre-adaptive output and existing tests don't regress.
+func buildAdaptiveDirective(in domain.InterviewSeed) string {
+	if len(in.PastInterviews) == 0 && len(in.WeakAreas) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\nADAPTIVE DIFFICULTY DIRECTIVE:\n")
+
+	if len(in.PastInterviews) > 0 {
+		var sum float64
+		for _, h := range in.PastInterviews {
+			sum += h.AvgRating
+		}
+		avg := sum / float64(len(in.PastInterviews))
+		fmt.Fprintf(&b,
+			"The candidate has attempted similar roles %d time(s); historical avg %.1f/10.\n",
+			len(in.PastInterviews), avg,
+		)
+	}
+
+	if len(in.WeakAreas) > 0 {
+		b.WriteString("Prior recurring weak topics:\n")
+		for _, w := range in.WeakAreas {
+			fmt.Fprintf(&b, "- %q — scored %d/10, feedback: %q\n",
+				w.QuestionText, w.Rating, w.Feedback,
+			)
+		}
+	}
+
+	b.WriteString(`
+Calibrate the 5 questions accordingly:
+- Q1: medium warm-up on a topic the candidate has shown competence on (build confidence; do NOT repeat a high-scoring question verbatim).
+- Q2 and Q4: drill the weak topics named above with progressively deeper variants. Do NOT ask the verbatim past question — reformulate so the candidate cannot answer from rote memory.
+- Q3: a topic on the JD/resume the candidate has NOT been asked about in any prior session (novel territory).
+- Q5: a stretch goal that combines two adjacent skills.
+`)
+	return b.String()
 }
 
 func buildFollowUpPrompt(in domain.FollowUpSeed) string {

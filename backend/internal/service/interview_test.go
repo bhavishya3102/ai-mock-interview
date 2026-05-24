@@ -1194,6 +1194,137 @@ func TestSubmitAnswer_EmbeddingNotCalled_WhenSubmitFails(t *testing.T) {
 	require.Equal(t, 0, store.embedCallCount())
 }
 
+// --- CreateInterview adaptive enrichment ---
+
+func TestBuildInterviewSeed_FirstTimeUser_NoEnrichment(t *testing.T) {
+	// Default fakeStore returns nil for history and weak hits. No matter
+	// the LLM result, seed should be the basic shape with empty enrichment.
+	svc := NewInterviewService(&fakeStore{}, &fakeLLM{})
+
+	seed := svc.buildInterviewSeed(context.Background(),
+		CreateInterviewInput{
+			JobPosition:     "Backend Engineer",
+			JobDescription:  "Build Go services",
+			YearsExperience: 5,
+		},
+		"user_1",
+		"resume text here",
+	)
+	require.Equal(t, "Backend Engineer", seed.JobPosition)
+	require.Equal(t, "resume text here", seed.ResumeText)
+	require.Empty(t, seed.PastInterviews)
+	require.Empty(t, seed.WeakAreas)
+}
+
+func TestBuildInterviewSeed_ReturningUser_EnrichesWithHistoryAndWeak(t *testing.T) {
+	history := []domain.PastInterviewSummary{
+		{MockID: "mock-prev", JobPosition: "Backend Engineer", AvgRating: 5.4, AnsweredCount: 5},
+	}
+	weak := []domain.WeakAnswerHit{
+		{MockID: "mock-prev", QuestionText: "Explain MVCC", Rating: 4, Feedback: "no vacuum"},
+	}
+	store := &fakeStore{
+		listUserInterviewSummariesFunc: func(_ context.Context, userID string, limit int) ([]domain.PastInterviewSummary, error) {
+			require.Equal(t, "user_1", userID)
+			require.Equal(t, coachHistoryLimit, limit)
+			return history, nil
+		},
+		findSimilarWeakAnswersFunc: func(_ context.Context, userID string, vec []float32, threshold, limit int) ([]domain.WeakAnswerHit, error) {
+			require.Equal(t, "user_1", userID)
+			require.NotEmpty(t, vec)
+			require.Equal(t, coachWeakRatingMax, threshold)
+			require.Equal(t, coachWeakHitsLimit, limit)
+			return weak, nil
+		},
+	}
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, text string) ([]float32, error) {
+			require.Contains(t, text, "Backend Engineer", "role embed should include the job position")
+			require.Contains(t, text, "distributed systems", "role embed should include the job description")
+			return []float32{0.1, 0.2, 0.3}, nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	seed := svc.buildInterviewSeed(context.Background(),
+		CreateInterviewInput{
+			JobPosition:     "Backend Engineer",
+			JobDescription:  "Build distributed systems",
+			YearsExperience: 4,
+		},
+		"user_1",
+		"",
+	)
+	require.Equal(t, history, seed.PastInterviews)
+	require.Equal(t, weak, seed.WeakAreas)
+}
+
+func TestBuildInterviewSeed_EmbedFailure_StillReturnsHistory(t *testing.T) {
+	history := []domain.PastInterviewSummary{
+		{MockID: "mock-prev", JobPosition: "Backend Engineer", AvgRating: 6.0, AnsweredCount: 5},
+	}
+	store := &fakeStore{
+		listUserInterviewSummariesFunc: func(_ context.Context, _ string, _ int) ([]domain.PastInterviewSummary, error) {
+			return history, nil
+		},
+		findSimilarWeakAnswersFunc: func(_ context.Context, _ string, _ []float32, _, _ int) ([]domain.WeakAnswerHit, error) {
+			t.Fatal("weak search must NOT run when embed failed")
+			return nil, nil
+		},
+	}
+	llm := &fakeLLM{
+		embedFunc: func(_ context.Context, _ string) ([]float32, error) {
+			return nil, fmt.Errorf("embed down: %w", domain.ErrLLM)
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	seed := svc.buildInterviewSeed(context.Background(),
+		CreateInterviewInput{
+			JobPosition:     "Backend Engineer",
+			JobDescription:  "Build distributed systems",
+			YearsExperience: 4,
+		},
+		"user_1",
+		"",
+	)
+	require.Equal(t, history, seed.PastInterviews)
+	require.Empty(t, seed.WeakAreas)
+}
+
+func TestCreateInterview_FeedsEnrichedSeedToLLM(t *testing.T) {
+	// End-to-end shape: CreateInterview wires buildInterviewSeed into
+	// the GenerateQuestions call, so the LLM observes the enrichment.
+	history := []domain.PastInterviewSummary{
+		{MockID: "mock-prev", JobPosition: "Backend Engineer", AvgRating: 5.4, AnsweredCount: 5},
+	}
+	store := &fakeStore{
+		getInterviewByMockIDFunc: func(_ context.Context, _, userID string) (domain.MockInterview, error) {
+			return sampleInterview(userID), nil
+		},
+		listUserInterviewSummariesFunc: func(_ context.Context, _ string, _ int) ([]domain.PastInterviewSummary, error) {
+			return history, nil
+		},
+	}
+	var seenSeed domain.InterviewSeed
+	llm := &fakeLLM{
+		generateQuestionsFunc: func(_ context.Context, in domain.InterviewSeed) ([]domain.GeneratedQA, error) {
+			seenSeed = in
+			return defaultQuestions(), nil
+		},
+	}
+	svc := NewInterviewService(store, llm)
+
+	_, err := svc.CreateInterview(context.Background(), "user_1", CreateInterviewInput{
+		JobPosition:     "Backend Engineer",
+		JobDescription:  validJobDescription,
+		YearsExperience: 5,
+	})
+	require.NoError(t, err)
+	require.Equal(t, history, seenSeed.PastInterviews,
+		"CreateInterview must surface past-interview history to the question-generation LLM")
+}
+
 // --- Coach report enrichment ---
 
 func TestBuildCoachReportSeed_EnrichesWithHistoryAndFiltersCurrentInterview(t *testing.T) {

@@ -13,11 +13,20 @@ type GeneratedQA struct {
 // separate from CreateInterviewInput so the LLM layer doesn't depend on the
 // HTTP DTO. ResumeText is the candidate's extracted resume; empty when no
 // resume is on file, in which case the prompt falls back to role-only.
+//
+// PastInterviews and WeakAreas drive adaptive difficulty: when populated,
+// the prompt builder injects an ADAPTIVE DIFFICULTY DIRECTIVE that tells
+// the LLM to drill recurring weak topics and avoid repeating questions
+// the candidate has already aced. Both fields are optional — when empty
+// (first-time user, or enrichment failed) the prompt is byte-identical
+// to the pre-adaptive output.
 type InterviewSeed struct {
 	JobPosition     string
 	JobDescription  string
 	YearsExperience int
 	ResumeText      string
+	PastInterviews  []PastInterviewSummary
+	WeakAreas       []WeakAnswerHit
 }
 
 // ResumeStatus describes whether a user has a resume on file. UploadedAt is

@@ -217,10 +217,115 @@ No new HTTP-layer tests — the public contract is unchanged.
 - **Backfill of pre-existing answers**: optional later job; the coach
   report degrades gracefully without historical embeddings since
   `PastInterviews` rollups don't need them.
-- **Adaptive difficulty in `CreateInterview`**: next sub-phase. Will
-  reuse the same embedding column to find weak topics and inject them
-  into the question-generation prompt.
 - **Topic classification**: raw-text cosine similarity gets us 80% of
   the value at 0% of the operational cost.
 - **Frontend "improving" badges**: backend ships first; UI work tracked
   separately.
+
+## 10. Adaptive difficulty in CreateInterview
+
+Where Progress Tracking (§6–§7) is **reactive** — narrating after the
+fact — adaptive difficulty makes the system **proactive**: a returning
+user's next interview is calibrated to where they last struggled, before
+they even click Start.
+
+### Service flow
+
+`CreateInterview` already fetches the user's resume and feeds it into
+the question-generation seed. We extend the same flow with a new helper
+that mirrors `buildCoachReportSeed` (§6):
+
+```go
+func (s *InterviewService) buildInterviewSeed(
+    ctx context.Context,
+    in CreateInterviewInput,
+    clerkUserID string,
+    resumeText string,
+) domain.InterviewSeed
+```
+
+The helper:
+1. Sets the basic fields (job position, JD, years, resume) — same as today.
+2. `ListUserInterviewSummaries(userID, 5)` — recent attempts.
+3. `Embed(jobPosition + " " + jobDescription)` — role surface vector.
+4. `FindSimilarWeakAnswers(userID, vec, ratingThreshold=6, limit=5)` —
+   recurring weak topics on similar roles.
+5. Returns an `InterviewSeed` with the optional `PastInterviews` and
+   `WeakAreas` fields populated when enrichment succeeds.
+
+Failures of step 2/3/4 are logged at warn level and dropped. The seed
+still flows into the LLM with whatever was successfully gathered — a
+missing embedding doesn't block question generation.
+
+### Domain shape
+
+```go
+type InterviewSeed struct {
+    JobPosition     string
+    JobDescription  string
+    YearsExperience int
+    ResumeText      string
+    // Adaptive enrichment — both optional. When empty, the prompt
+    // builder skips the ADAPTIVE DIFFICULTY DIRECTIVE entirely and
+    // produces the byte-identical pre-memory prompt.
+    PastInterviews  []PastInterviewSummary
+    WeakAreas       []WeakAnswerHit
+}
+```
+
+### Prompt directive
+
+`buildQuestionPrompt` renders an extra section **only when** the seed
+carries at least one prior interview OR one weak hit:
+
+```
+ADAPTIVE DIFFICULTY DIRECTIVE:
+The candidate has attempted similar roles N times (avg X.X/10).
+Prior recurring weak topics:
+- "Explain goroutine cleanup" — scored 3/10, feedback: "confused mount and unmount"
+- "What does context.Context propagate" — scored 4/10, feedback: "missed deadlines"
+
+Calibrate the 5 questions accordingly:
+- Q1: medium warm-up on a topic the candidate has shown competence on
+  (build confidence, do NOT repeat a high-scoring question verbatim)
+- Q2 & Q4: drill the weak topics named above with progressively deeper
+  variants — do NOT ask the verbatim past question; reformulate
+- Q3: a topic on the JD/resume the candidate has NOT been asked about
+  in any prior session (novel territory)
+- Q5: a stretch goal that combines two adjacent skills
+```
+
+For first-time users (no past interviews, no weak hits) the directive
+is omitted entirely — the prompt is byte-identical to today's output,
+so existing CreateInterview tests remain valid without modification.
+
+### Backward compatibility
+
+| User type | Existing prompt path | Adaptive path |
+|---|---|---|
+| First-time user | ✅ Unchanged | n/a (skipped) |
+| Returning user, embedding failed | ✅ Unchanged | n/a (graceful skip) |
+| Returning user, no weak hits on similar role | ✅ Unchanged | n/a (skipped) |
+| Returning user with history | n/a | New directive injected |
+
+### Testing additions
+
+| Layer | Cases |
+|---|---|
+| `service/interview_test.go` | first-time user → seed has empty enrichment; returning user → seed enriched with history + weak hits; embed failure → falls back gracefully; existing CreateInterview tests (8+ cases) still pass without modification because their fakeStore returns nil for the new methods |
+| `llm/prompts_test.go` | directive present for returning user with at least one prior interview; directive absent for first-time user; weak hits cited verbatim in directive when present |
+
+### Failure mode containment
+
+`CreateInterview` is a hot-path endpoint; an enrichment regression
+would degrade every new interview's question quality. Mitigations:
+
+- **Graceful skip**: every enrichment step logs+drops on failure, never
+  blocks the LLM call.
+- **No new sentinel errors**: failures wrap existing `ErrLLM` only.
+- **Backward-compatible prompt**: first-time-user path is unchanged, so
+  the only behavior change is for users with history.
+
+A feature flag is *not* added in this slice — the graceful-skip path
+already provides equivalent safety, and the user explicitly approved
+both adaptive difficulty and trend badges as standalone shippable units.

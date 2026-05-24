@@ -43,6 +43,85 @@ func TestBuildQuestionPrompt_BlankResumeTreatedAsAbsent(t *testing.T) {
 	require.False(t, strings.Contains(p, "MUST reference specific"))
 }
 
+func TestBuildQuestionPrompt_FirstTimeUser_NoAdaptiveDirective(t *testing.T) {
+	// First-time user: no PastInterviews, no WeakAreas → directive omitted
+	// and the prompt is byte-identical to the pre-adaptive output.
+	p := buildQuestionPrompt(domain.InterviewSeed{
+		JobPosition:     "Backend Engineer",
+		JobDescription:  "Build Go services",
+		YearsExperience: 5,
+	})
+	require.NotContains(t, p, "ADAPTIVE DIFFICULTY DIRECTIVE")
+	require.NotContains(t, p, "Calibrate the 5 questions")
+}
+
+func TestBuildQuestionPrompt_ReturningUser_InjectsAdaptiveDirective(t *testing.T) {
+	p := buildQuestionPrompt(domain.InterviewSeed{
+		JobPosition:     "Backend Engineer",
+		JobDescription:  "Build Go microservices with Postgres",
+		YearsExperience: 3,
+		PastInterviews: []domain.PastInterviewSummary{
+			{MockID: "mock-1", JobPosition: "Backend Engineer", AvgRating: 5.4, AnsweredCount: 5},
+			{MockID: "mock-2", JobPosition: "Backend Engineer", AvgRating: 6.2, AnsweredCount: 5},
+		},
+		WeakAreas: []domain.WeakAnswerHit{
+			{MockID: "mock-1", QuestionText: "Explain goroutine cleanup", Rating: 4, Feedback: "confused mount and unmount"},
+		},
+	})
+
+	require.Contains(t, p, "ADAPTIVE DIFFICULTY DIRECTIVE")
+	// Historical context: count + computed average reach the LLM so it can
+	// calibrate (5.4 + 6.2)/2 = 5.8.
+	require.Contains(t, p, "2 time(s)")
+	require.Contains(t, p, "5.8/10")
+	// Weak evidence cited verbatim — LLM is told NOT to repeat verbatim.
+	require.Contains(t, p, "Explain goroutine cleanup")
+	require.Contains(t, p, "confused mount and unmount")
+	require.Contains(t, p, "Do NOT ask the verbatim past question")
+	// Question-shape directive present so the LLM knows what to do with
+	// the historical context it just received.
+	require.Contains(t, p, "Q1: medium warm-up")
+	require.Contains(t, p, "Q3: a topic on the JD/resume the candidate has NOT been asked")
+}
+
+func TestBuildQuestionPrompt_OnlyWeakAreas_NoHistory_StillInjects(t *testing.T) {
+	// Edge: weak hits exist but ListUserInterviewSummaries failed (warn
+	// dropped) so PastInterviews is empty. The directive should still
+	// render — weak topics alone are signal enough to calibrate.
+	p := buildQuestionPrompt(domain.InterviewSeed{
+		JobPosition:     "Frontend Engineer",
+		JobDescription:  "React + TypeScript",
+		YearsExperience: 2,
+		WeakAreas: []domain.WeakAnswerHit{
+			{MockID: "mock-x", QuestionText: "What does useEffect cleanup do?", Rating: 3, Feedback: "fundamental misunderstanding"},
+		},
+	})
+
+	require.Contains(t, p, "ADAPTIVE DIFFICULTY DIRECTIVE")
+	require.NotContains(t, p, "historical avg") // no past-interview line when history empty
+	require.Contains(t, p, "useEffect cleanup")
+}
+
+func TestBuildQuestionPrompt_PastHistoryOnly_NoWeakHits_StillInjects(t *testing.T) {
+	// Symmetric to above: prior interviews exist but no rating was low
+	// enough to qualify as a weak hit (or embedding failed). Still
+	// inject the directive so the LLM at least respects the history.
+	p := buildQuestionPrompt(domain.InterviewSeed{
+		JobPosition:     "Data Scientist",
+		JobDescription:  "ML pipelines on GCP",
+		YearsExperience: 4,
+		PastInterviews: []domain.PastInterviewSummary{
+			{MockID: "mock-a", JobPosition: "Data Scientist", AvgRating: 8.4, AnsweredCount: 5},
+		},
+	})
+
+	require.Contains(t, p, "ADAPTIVE DIFFICULTY DIRECTIVE")
+	require.Contains(t, p, "1 time(s)")
+	require.Contains(t, p, "8.4/10")
+	// No weak-topic bullets when WeakAreas is empty.
+	require.NotContains(t, p, "Prior recurring weak topics:")
+}
+
 func TestBuildCoachReportPrompt_IncludesContextAndStructure(t *testing.T) {
 	p := buildCoachReportPrompt(domain.CoachReportSeed{
 		JobPosition:     "Frontend Engineer",
